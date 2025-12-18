@@ -27,3 +27,8 @@ class SearchUserState(StatesGroup):
     """States for searching users."""
     waiting_for_user_id = State()
 
+
+class ChatState(StatesGroup):
+    """States for live chat feature."""
+    in_chat = State()
+

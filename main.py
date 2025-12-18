@@ -12,6 +12,7 @@ from config import BOT_TOKEN
 from db import init_db
 from handlers.user_handlers import user_router
 from handlers.admin_handlers import admin_router
+from handlers.chat_handlers import chat_router
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +31,7 @@ async def main():
     # Include routers
     dp.include_router(user_router)
     dp.include_router(admin_router)
+    dp.include_router(chat_router)
 
     try:
         # Start polling

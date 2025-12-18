@@ -45,6 +45,23 @@ async def init_db():
                 sent_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_connections(
+                id          SERIAL PRIMARY KEY,
+                user1_id    BIGINT NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
+                user2_id    BIGINT NOT NULL REFERENCES users (user_id) ON DELETE CASCADE,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user1_id, user2_id)
+            );
+        """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_queue(
+                user_id     BIGINT PRIMARY KEY REFERENCES users (user_id) ON DELETE CASCADE,
+                joined_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
     return pool
 
 
@@ -108,3 +125,105 @@ async def get_or_create_user(pool, user_id: int, username: str, name: str):
                 user_id, username, name, token, tashkent_time
             )
             return token
+
+
+# Chat-related database functions
+
+async def add_to_chat_queue(pool, user_id: int):
+    """Add user to the chat queue if not already in queue or in an active chat."""
+    async with pool.acquire() as conn:
+        # Check if user is already in a chat
+        active_chat = await conn.fetchrow("""
+            SELECT user1_id, user2_id FROM chat_connections 
+            WHERE user1_id = $1 OR user2_id = $1
+        """, user_id)
+        
+        if active_chat:
+            return False, "already_in_chat"
+        
+        # Check if user is already in queue
+        in_queue = await conn.fetchrow("SELECT user_id FROM chat_queue WHERE user_id = $1", user_id)
+        if in_queue:
+            return False, "already_in_queue"
+        
+        # Add to queue
+        await conn.execute("INSERT INTO chat_queue (user_id) VALUES ($1)", user_id)
+        return True, "added"
+
+
+async def find_chat_partner(pool, user_id: int):
+    """
+    Find a random chat partner for the user from the queue.
+    Returns (found: bool, partner_id: int | None)
+    """
+    async with pool.acquire() as conn:
+        # Get a random user from queue (excluding current user)
+        partner = await conn.fetchrow("""
+            SELECT user_id FROM chat_queue 
+            WHERE user_id != $1 
+            ORDER BY RANDOM() 
+            LIMIT 1
+        """, user_id)
+        
+        if partner:
+            partner_id = partner["user_id"]
+            # Remove both users from queue
+            await conn.execute("DELETE FROM chat_queue WHERE user_id IN ($1, $2)", user_id, partner_id)
+            # Create chat connection
+            await conn.execute("""
+                INSERT INTO chat_connections (user1_id, user2_id) 
+                VALUES ($1, $2)
+            """, user_id, partner_id)
+            return True, partner_id
+        
+        return False, None
+
+
+async def get_chat_partner(pool, user_id: int):
+    """Get the chat partner ID for a user. Returns partner_id or None."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT 
+                CASE 
+                    WHEN user1_id = $1 THEN user2_id 
+                    ELSE user1_id 
+                END as partner_id
+            FROM chat_connections 
+            WHERE user1_id = $1 OR user2_id = $1
+        """, user_id)
+        return row["partner_id"] if row else None
+
+
+async def end_chat(pool, user_id: int):
+    """
+    End chat for a user and their partner.
+    Returns (ended: bool, partner_id: int | None)
+    """
+    async with pool.acquire() as conn:
+        # Get partner
+        partner_row = await conn.fetchrow("""
+            SELECT 
+                CASE 
+                    WHEN user1_id = $1 THEN user2_id 
+                    ELSE user1_id 
+                END as partner_id
+            FROM chat_connections 
+            WHERE user1_id = $1 OR user2_id = $1
+        """, user_id)
+        
+        if partner_row:
+            partner_id = partner_row["partner_id"]
+            # Delete chat connection
+            await conn.execute("""
+                DELETE FROM chat_connections 
+                WHERE (user1_id = $1 AND user2_id = $2) OR (user1_id = $2 AND user2_id = $1)
+            """, user_id, partner_id)
+            return True, partner_id
+        
+        return False, None
+
+
+async def remove_from_chat_queue(pool, user_id: int):
+    """Remove user from chat queue."""
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM chat_queue WHERE user_id = $1", user_id)
