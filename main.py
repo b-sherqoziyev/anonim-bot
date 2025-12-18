@@ -26,11 +26,11 @@ async def main():
     # Initialize database connection pool
     pool = await init_db()
     dp["db"] = pool
-    
+
     # Include routers
     dp.include_router(user_router)
     dp.include_router(admin_router)
-    
+
     try:
         # Start polling
         await dp.start_polling(bot)
