@@ -1,0 +1,29 @@
+"""
+FSM States module.
+Defines all Finite State Machine states used throughout the bot.
+"""
+from aiogram.fsm.state import State, StatesGroup
+
+
+class QuestionStates(StatesGroup):
+    """States for handling anonymous question flow."""
+    waiting_for_question = State()
+
+
+class MuteState(StatesGroup):
+    """States for muting/unmuting users."""
+    waiting_for_user_id = State()
+    waiting_for_duration = State()
+    waiting_for_reason = State()
+    waiting_for_unmute_id = State()
+
+
+class BroadcastState(StatesGroup):
+    """States for broadcast message flow."""
+    waiting_for_message = State()
+
+
+class SearchUserState(StatesGroup):
+    """States for searching users."""
+    waiting_for_user_id = State()
+

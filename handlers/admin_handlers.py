@@ -1,39 +1,31 @@
+"""
+Admin handlers module.
+Handles admin panel, mute/unmute, broadcast, statistics, and user search functionality.
+"""
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.enums import ParseMode
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from aiogram.enums import ParseMode
 import asyncio
 import logging
 
-# Configure logging for debugging
-logging.basicConfig(level=logging.INFO)
+from config import TIMEZONE
+from db import is_user_admin
+from states import MuteState, BroadcastState, SearchUserState
+
+# Configure logging
 logger = logging.getLogger(__name__)
 
+# Create router for admin handlers
 admin_router = Router()
 
-class MuteState(StatesGroup):
-    waiting_for_user_id = State()
-    waiting_for_duration = State()
-    waiting_for_reason = State()
-    waiting_for_unmute_id = State()
-
-class BroadcastState(StatesGroup):
-    waiting_for_message = State()
-
-class SearchUserState(StatesGroup):
-    waiting_for_user_id = State()
-
-async def is_user_admin(pool, user_id: int) -> bool:
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT is_admin FROM users WHERE user_id = $1", user_id)
-        return bool(row and row['is_admin'])
 
 @admin_router.message(Command("admin"))
 async def admin_panel_entry(message: Message, bot: Bot, dispatcher):
+    """Entry point for admin panel - shows main menu."""
     pool = dispatcher["db"]
     user_id = message.from_user.id
 
@@ -51,11 +43,13 @@ async def admin_panel_entry(message: Message, bot: Bot, dispatcher):
         reply_markup=keyboard
     )
 
+
 @admin_router.callback_query(F.data == "admin:stats")
 async def show_statistics(callback: CallbackQuery, bot: Bot, dispatcher):
-    pool = dispatcher['db']
+    """Display bot statistics (total users, monthly, daily)."""
+    pool = dispatcher["db"]
 
-    tashkent_now = datetime.now(ZoneInfo("Asia/Tashkent"))
+    tashkent_now = datetime.now(ZoneInfo(TIMEZONE))
     today_start = tashkent_now.replace(hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
     month_start = tashkent_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).replace(tzinfo=None)
 
@@ -83,8 +77,10 @@ async def show_statistics(callback: CallbackQuery, bot: Bot, dispatcher):
     )
     await callback.answer()
 
+
 @admin_router.callback_query(F.data == "admin:back_to_panel")
 async def back_to_main_menu(callback: CallbackQuery):
+    """Return to main admin panel menu."""
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin:broadcast")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="admin:stats")],
@@ -97,34 +93,40 @@ async def back_to_main_menu(callback: CallbackQuery):
     )
     await callback.answer()
 
+
 @admin_router.callback_query(F.data == "admin:users")
 async def open_users_menu(callback: CallbackQuery):
+    """Open users management menu."""
     users_menu = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Foydalanuvchini qidirish", callback_data="admin:search")],
         [InlineKeyboardButton(text="🆕 So‘nggi 10 user", callback_data="admin:recent_users:1")],
         [InlineKeyboardButton(text="⛔ Bloklash / Mute", callback_data="admin:punish")],
-        [InlineKeyboardButton(text="🔓 Mute’dan chiqarish", callback_data="admin:unmute")],
+        [InlineKeyboardButton(text="🔓 Mute'dan chiqarish", callback_data="admin:unmute")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="admin:back_to_panel")],
     ])
 
     await callback.message.edit_text(
-        "<b>👥 Foydalanuvchilar bo‘limi:</b>\nKerakli funksiyani tanlang:",
+        "<b>👥 Foydalanuvchilar bo'limi:</b>\nKerakli funksiyani tanlang:",
         reply_markup=users_menu
     )
     await callback.answer()
 
+
 @admin_router.callback_query(F.data == "admin:broadcast")
 async def start_broadcast(callback: CallbackQuery, state: FSMContext):
+    """Start broadcast message flow."""
     await state.set_state(BroadcastState.waiting_for_message)
     await callback.message.edit_text(
-        "<b>📢 Yubormoqchi bo‘lgan xabaringizni yozing:</b>\n"
-        "Matn yoki rasm/video bilan matn ham bo‘lishi mumkin."
+        "<b>📢 Yubormoqchi bo'lgan xabaringizni yozing:</b>\n"
+        "Matn yoki rasm/video bilan matn ham bo'lishi mumkin."
     )
     await callback.answer()
 
+
 @admin_router.message(BroadcastState.waiting_for_message)
 async def process_broadcast(message: Message, state: FSMContext, bot: Bot, dispatcher):
-    pool = dispatcher['db']
+    """Process and send broadcast message to all users."""
+    pool = dispatcher["db"]
     await state.clear()
 
     await message.answer("<i>⏳ Xabar yuborilmoqda...</i>")
@@ -178,35 +180,43 @@ async def process_broadcast(message: Message, state: FSMContext, bot: Bot, dispa
         parse_mode=ParseMode.HTML
     )
 
+
 @admin_router.callback_query(F.data == "admin:punish")
 async def start_mute(callback: CallbackQuery, state: FSMContext):
+    """Start mute user flow."""
     await state.set_state(MuteState.waiting_for_user_id)
     await callback.message.edit_text("🆔 Foydalanuvchi ID raqamini yuboring:")
     await callback.answer()
 
+
 @admin_router.message(MuteState.waiting_for_user_id)
 async def get_user_id(message: Message, state: FSMContext):
+    """Get user ID for muting."""
     try:
         user_id = int(message.text.strip())
         await state.update_data(user_id=user_id)
         await state.set_state(MuteState.waiting_for_duration)
-        await message.answer("⏰ Mute necha daqiqaga bo‘lsin? (Masalan: 60)")
+        await message.answer("⏰ Mute necha daqiqaga bo'lsin? (Masalan: 60)")
     except ValueError:
-        await message.answer("❌ Noto‘g‘ri ID. Qayta urinib ko‘ring.")
+        await message.answer("❌ Noto'g'ri ID. Qayta urinib ko'ring.")
+
 
 @admin_router.message(MuteState.waiting_for_duration)
 async def get_duration(message: Message, state: FSMContext):
+    """Get mute duration in minutes."""
     try:
         minutes = int(message.text.strip())
-        muted_until = (datetime.now(ZoneInfo("Asia/Tashkent")) + timedelta(minutes=minutes)).replace(tzinfo=None)
+        muted_until = (datetime.now(ZoneInfo(TIMEZONE)) + timedelta(minutes=minutes)).replace(tzinfo=None)
         await state.update_data(muted_until=muted_until)
         await state.set_state(MuteState.waiting_for_reason)
         await message.answer("📝 Sababni yozing:")
     except ValueError:
-        await message.answer("❌ Noto‘g‘ri raqam. Qayta urinib ko‘ring.")
+        await message.answer("❌ Noto'g'ri raqam. Qayta urinib ko'ring.")
+
 
 @admin_router.message(MuteState.waiting_for_reason)
-async def finish_mute(message: Message, state: FSMContext, dispatcher):
+async def finish_mute(message: Message, state: FSMContext, bot: Bot, dispatcher):
+    """Complete mute process and save to database."""
     data = await state.get_data()
     await state.clear()
 
@@ -229,14 +239,18 @@ async def finish_mute(message: Message, state: FSMContext, dispatcher):
         parse_mode="HTML"
     )
 
+
 @admin_router.callback_query(F.data == "admin:unmute")
 async def ask_user_id_for_unmute(callback: CallbackQuery, state: FSMContext):
+    """Start unmute user flow."""
     await state.set_state(MuteState.waiting_for_unmute_id)
-    await callback.message.answer("🔓 Mute’dan chiqariladigan foydalanuvchi ID sini kiriting:")
+    await callback.message.answer("🔓 Mute'dan chiqariladigan foydalanuvchi ID sini kiriting:")
     await callback.answer()
 
+
 @admin_router.message(MuteState.waiting_for_unmute_id)
-async def unmute_user(message: Message, state: FSMContext, dispatcher):
+async def unmute_user(message: Message, state: FSMContext, bot: Bot, dispatcher):
+    """Remove user from mute list."""
     user_id = message.text.strip()
     await state.clear()
 
@@ -245,30 +259,38 @@ async def unmute_user(message: Message, state: FSMContext, dispatcher):
         result = await conn.execute("DELETE FROM muted_users WHERE user_id = $1", int(user_id))
 
     if result == "DELETE 1":
-        await message.answer(f"✅ <a href='tg://user?id={user_id}'>Foydalanuvchi</a> mute’dan chiqarildi.",
-                             parse_mode="HTML")
+        await message.answer(
+            f"✅ <a href='tg://user?id={user_id}'>Foydalanuvchi</a> mute'dan chiqarildi.",
+            parse_mode="HTML"
+        )
     else:
         await message.answer("❌ Bu foydalanuvchi bazada mute qilinmagan edi.")
 
+
 @admin_router.callback_query(F.data == "admin:search")
 async def ask_user_id(callback: CallbackQuery, state: FSMContext):
+    """Start user search flow."""
     await callback.message.edit_text("🔍 Qidirish uchun foydalanuvchi ID sini yuboring:")
     await state.set_state(SearchUserState.waiting_for_user_id)
 
+
 @admin_router.message(SearchUserState.waiting_for_user_id)
-async def show_user_info(message: Message, state: FSMContext, dispatcher):
+async def show_user_info(message: Message, state: FSMContext, bot: Bot, dispatcher):
+    """Display user information by ID."""
     await state.clear()
     pool = dispatcher["db"]
 
     try:
         user_id = int(message.text.strip())
     except ValueError:
-        await message.answer("❌ Noto‘g‘ri ID format. Iltimos, faqat raqam yuboring.")
+        await message.answer("❌ Noto'g'ri ID format. Iltimos, faqat raqam yuboring.")
         return
 
     async with pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT user_id, username, name, is_admin, created_at FROM users WHERE user_id = $1",
-                                   user_id)
+        user = await conn.fetchrow(
+            "SELECT user_id, username, name, is_admin, created_at FROM users WHERE user_id = $1",
+            user_id
+        )
         if not user:
             await message.answer("😕 Bunday foydalanuvchi topilmadi.")
             return
@@ -282,14 +304,16 @@ async def show_user_info(message: Message, state: FSMContext, dispatcher):
         f"👤 <b>Foydalanuvchi haqida:</b>\n\n"
         f"🆔 ID: <code>{user['user_id']}</code>\n"
         f"📛 Ism: {user['name']}\n"
-        f"🗓 Ro‘yxatdan o‘tgan: {user['created_at']:%Y-%m-%d %H:%M}\n"
+        f"🗓 Ro'yxatdan o'tgan: {user['created_at']:%Y-%m-%d %H:%M}\n"
         f"🛡 Admin: {'✅' if user['is_admin'] else '❌'}\n"
         f"🔇 Mute: {'✅ ' + muted_until.strftime('%Y-%m-%d %H:%M') if is_muted else '❌'}",
         parse_mode=ParseMode.HTML
     )
 
+
 @admin_router.callback_query(F.data.startswith("admin:recent_users:"))
-async def show_recent_users(callback: CallbackQuery, dispatcher):
+async def show_recent_users(callback: CallbackQuery, bot: Bot, dispatcher):
+    """Display recent users with pagination."""
     pool = dispatcher["db"]
     page = int(callback.data.split(":")[-1])
     users_per_page = 10
@@ -304,7 +328,7 @@ async def show_recent_users(callback: CallbackQuery, dispatcher):
 
     total_pages = (total_users + users_per_page - 1) // users_per_page
 
-    text = "<b>🆕 So‘nggi foydalanuvchilar:</b>\n\n"
+    text = "<b>🆕 So'nggi foydalanuvchilar:</b>\n\n"
     if not users:
         text += "😕 Foydalanuvchilar topilmadi."
     else:
@@ -333,14 +357,18 @@ async def show_recent_users(callback: CallbackQuery, dispatcher):
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     await callback.answer()
 
+
 @admin_router.callback_query(F.data.startswith("admin:select_user:"))
-async def select_user(callback: CallbackQuery, dispatcher):
+async def select_user(callback: CallbackQuery, bot: Bot, dispatcher):
+    """Display detailed information about a selected user."""
     pool = dispatcher["db"]
     user_id = int(callback.data.split(":")[-1])
 
     async with pool.acquire() as conn:
-        user = await conn.fetchrow("SELECT user_id, username, name, is_admin, created_at FROM users WHERE user_id = $1",
-                                   user_id)
+        user = await conn.fetchrow(
+            "SELECT user_id, username, name, is_admin, created_at FROM users WHERE user_id = $1",
+            user_id
+        )
         if not user:
             await callback.message.edit_text("😕 Bunday foydalanuvchi topilmadi.", parse_mode=ParseMode.HTML)
             await callback.answer()
@@ -355,7 +383,7 @@ async def select_user(callback: CallbackQuery, dispatcher):
         f"👤 <b>Foydalanuvchi haqida:</b>\n\n"
         f"🆔 ID: <code>{user['user_id']}</code>\n"
         f"📛 Ism: {user['name']}\n"
-        f"🗓 Ro‘yxatdan o‘tgan: {user['created_at']:%Y-%m-%d %H:%M}\n"
+        f"🗓 Ro'yxatdan o'tgan: {user['created_at']:%Y-%m-%d %H:%M}\n"
         f"🛡 Admin: {'✅' if user['is_admin'] else '❌'}\n"
         f"🔇 Mute: {'✅ ' + muted_until.strftime('%Y-%m-%d %H:%M') if is_muted else '❌'}"
     )
@@ -366,3 +394,4 @@ async def select_user(callback: CallbackQuery, dispatcher):
 
     await callback.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
     await callback.answer()
+
