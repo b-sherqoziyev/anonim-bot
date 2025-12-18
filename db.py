@@ -62,6 +62,16 @@ async def init_db():
                 joined_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_logs(
+                id          SERIAL PRIMARY KEY,
+                admin_id    BIGINT NOT NULL,
+                action      TEXT NOT NULL,
+                details     TEXT,
+                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
     return pool
 
 
@@ -227,3 +237,86 @@ async def remove_from_chat_queue(pool, user_id: int):
     """Remove user from chat queue."""
     async with pool.acquire() as conn:
         await conn.execute("DELETE FROM chat_queue WHERE user_id = $1", user_id)
+
+
+# Admin-related database functions
+
+async def get_all_active_chats(pool):
+    """Get all active chat connections with user information."""
+    async with pool.acquire() as conn:
+        chats = await conn.fetch("""
+            SELECT 
+                cc.id,
+                cc.user1_id,
+                cc.user2_id,
+                cc.created_at,
+                u1.name as user1_name,
+                u2.name as user2_name
+            FROM chat_connections cc
+            LEFT JOIN users u1 ON cc.user1_id = u1.user_id
+            LEFT JOIN users u2 ON cc.user2_id = u2.user_id
+            ORDER BY cc.created_at DESC
+        """)
+        return chats
+
+
+async def get_chat_message_count(pool, user1_id: int, user2_id: int):
+    """Get message count between two users in message_log."""
+    async with pool.acquire() as conn:
+        count = await conn.fetchval("""
+            SELECT COUNT(*) FROM message_log
+            WHERE (sender_id = $1 AND receiver_id = $2) 
+               OR (sender_id = $2 AND receiver_id = $1)
+        """, user1_id, user2_id)
+        return count or 0
+
+
+async def get_all_muted_users(pool):
+    """Get all muted users with their information."""
+    async with pool.acquire() as conn:
+        muted = await conn.fetch("""
+            SELECT 
+                mu.user_id,
+                mu.muted_until,
+                mu.reason,
+                mu.created_at,
+                u.name,
+                u.username
+            FROM muted_users mu
+            LEFT JOIN users u ON mu.user_id = u.user_id
+            WHERE mu.muted_until > CURRENT_TIMESTAMP
+            ORDER BY mu.muted_until DESC
+        """)
+        return muted
+
+
+async def get_muted_users_count(pool):
+    """Get count of currently muted users."""
+    async with pool.acquire() as conn:
+        count = await conn.fetchval("""
+            SELECT COUNT(*) FROM muted_users
+            WHERE muted_until > CURRENT_TIMESTAMP
+        """)
+        return count or 0
+
+
+async def admin_end_chat_by_id(pool, chat_id: int):
+    """End a chat by chat connection ID. Returns (success: bool, user1_id, user2_id)."""
+    async with pool.acquire() as conn:
+        chat = await conn.fetchrow("""
+            SELECT user1_id, user2_id FROM chat_connections WHERE id = $1
+        """, chat_id)
+        
+        if chat:
+            await conn.execute("DELETE FROM chat_connections WHERE id = $1", chat_id)
+            return True, chat["user1_id"], chat["user2_id"]
+        return False, None, None
+
+
+async def log_admin_action(pool, admin_id: int, action: str, details: str = None):
+    """Log an admin action to the database."""
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO admin_logs (admin_id, action, details)
+            VALUES ($1, $2, $3)
+        """, admin_id, action, details)

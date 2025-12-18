@@ -57,7 +57,8 @@ async def start_handler(message: Message, command: CommandObject, state: FSMCont
             f"<b>👋 Xush kelibsiz, {name}!\n</b>"
             f"<b>Bu sizning shaxsiy havolangiz:\n</b>"
             f"\n🔗 {link}\n\n"
-            f"<b>Ulashish orqali anonim suhbat quring!</b>",
+            f"<b>Ulashish orqali anonim suhbat quring!</b>\n"
+            f"<b>Bot haqida bilish uchun 👉 /help</b>",
             reply_markup=share_keyboard
         )
 
@@ -96,30 +97,30 @@ async def handle_question(message: Message, state: FSMContext, bot: Bot, dispatc
             # Media messages (photo, video, voice, document)
             if message.photo:
                 await bot.send_photo(
-                    target_id, 
+                    target_id,
                     message.photo[-1].file_id,
-                    caption="<b>📨 Sizga yangi anonim xabar bor!</b>", 
+                    caption="<b>📨 Sizga yangi anonim xabar bor!</b>",
                     reply_markup=keyboard
                 )
             elif message.video:
                 await bot.send_video(
-                    target_id, 
-                    message.video.file_id, 
+                    target_id,
+                    message.video.file_id,
                     caption="<b>📨 Sizga yangi anonim xabar bor!</b>",
                     reply_markup=keyboard
                 )
             elif message.voice:
                 await bot.send_voice(
-                    target_id, 
-                    message.voice.file_id, 
+                    target_id,
+                    message.voice.file_id,
                     caption="<b>📨 Sizga yangi anonim xabar bor!</b>",
                     reply_markup=keyboard
                 )
             elif message.document:
                 await bot.send_document(
-                    target_id, 
+                    target_id,
                     message.document.file_id,
-                    caption="<b>📨 Sizga yangi anonim xabar bor!</b>", 
+                    caption="<b>📨 Sizga yangi anonim xabar bor!</b>",
                     reply_markup=keyboard
                 )
             else:
@@ -142,7 +143,8 @@ async def handle_question(message: Message, state: FSMContext, bot: Bot, dispatc
             elif message.voice:
                 await bot.send_voice(LOG_CHANNEL_ID, message.voice.file_id, caption=log_caption, parse_mode='HTML')
             elif message.document:
-                await bot.send_document(LOG_CHANNEL_ID, message.document.file_id, caption=log_caption, parse_mode='HTML')
+                await bot.send_document(LOG_CHANNEL_ID, message.document.file_id, caption=log_caption,
+                                        parse_mode='HTML')
 
         await message.answer("✅ Xabaringiz yuborildi!", reply_markup=ReplyKeyboardRemove())
 
@@ -159,7 +161,7 @@ async def send_help(message: Message, bot: Bot, dispatcher):
     """Handle /help command - show help information."""
     from db import is_user_admin
     from config import ADMIN_URL
-    
+
     pool = dispatcher["db"]
     user_id = message.from_user.id
 
@@ -174,9 +176,40 @@ async def send_help(message: Message, bot: Bot, dispatcher):
         # Regular user help
         await message.answer(
             "<b>❓ Yordam</b>\n\n"
-            "Quyidagi komandalar mavjud:\n"
-            "• /start — botni ishga tushurish\n"
-            "• /help — yordam oynasi\n\n"
-            f"Agar sizga qo‘shimcha yordam kerak bo‘lsa, <a href='{ADMIN_URL}'>admin</a> bilan bog‘laning."
+            "Botning asosiy komandalarini bilib oling:\n"
+            "• /start — botni ishga tushirish va shaxsiy havola olish\n"
+            "• /help — yordam oynasi (shu xabar)\n"
+            "• /find_chat — anonim tarzda suhbatdosh qidirish\n"
+            "• /stop_chat — jonli chatni yakunlash\n"
+            "• /info — bot haqida batafsil ma’lumot\n\n"
+            "Ko‘proq ma’lumot olish uchun /info yuboring.",
+            parse_mode="HTML"
         )
 
+
+@user_router.message(Command("info"))
+async def send_info(message: Message, bot: Bot, dispatcher):
+    """Handle /info command - show detailed information about the bot."""
+    from config import ADMIN_URL
+
+    bot_username = (await bot.me()).username
+    example_link = f"https://t.me/{bot_username}?start=example_token"
+
+    info_text = (
+        "<b>ℹ️ Bot haqida batafsil</b>\n\n"
+        "👋 Salom! Bu bot anonim xabar yuborish va jonli chat qilish imkonini beradi.\n\n"
+        "<b>1️⃣ Shaxsiy havola (start link)</b>\n"
+        "/start komandasi orqali sizga maxsus shaxsiy havola beriladi.\n"
+        "Bu havolani boshqalar bilan ulashsangiz, ular sizga anonim xabar yuborishi mumkin.\n\n"
+        "<b>2️⃣ Anonim xabar yuborish</b>\n"
+        "Havola orqali kelgan foydalanuvchi sizga anonim xabar yuboradi.\n"
+        "Siz ham shunday havola orqali boshqa foydalanuvchilarga anonim xabar yuborishingiz mumkin.\n\n"
+        "<b>3️⃣ Jonli chat qilish</b>\n"
+        "• /find_chat komandasi yordamida tasodifiy foydalanuvchi bilan jonli suhbat boshlaysiz.\n"
+        "• /end_chat orqali suhbatni yakunlashingiz mumkin.\n"
+        "• Suhbat anonim tarzda kechadi, shaxsiy ma'lumotlar oshkor qilinmaydi.\n\n"
+        f"<b>🔗 Qo'shimcha yordam</b>\n"
+        f"Agar sizga yordam kerak bo'lsa yoki xatolik yuz bersa, admin bilan bog'laning: <a href='{ADMIN_URL}'>admin</a>"
+    )
+
+    await message.answer(info_text, parse_mode='HTML')
