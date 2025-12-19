@@ -14,7 +14,8 @@ from db import (
     get_user_balance_info, get_user_premium_info, VALID_PLANS, PLAN_PRICES,
     get_plan_price, create_payment, update_payment_status, update_user_balance,
     activate_subscription, check_transaction_id_exists,
-    generate_referral_code, get_user_referral_code
+    generate_referral_code, get_user_referral_code,
+    notify_admins_new_user, is_user_premium, set_user_hidden
 )
 from states import QuestionStates, PremiumPurchaseState
 from datetime import datetime, timedelta
@@ -46,14 +47,18 @@ async def start_handler(message: Message, command: CommandObject, state: FSMCont
 
             if not existing_user:
                 # New user - create with referral
-                token = await get_or_create_user(pool, user_id, username, name, referral_code)
+                token, is_new = await get_or_create_user(pool, user_id, username, name, referral_code)
 
                 # Process referral bonus and send notification
                 from db import process_referral
                 await process_referral(pool, user_id, referral_code, bot)
+                
+                # Notify admins about new user
+                if is_new:
+                    await notify_admins_new_user(pool, bot, user_id, username, name)
             else:
                 # User already exists - referral won't count
-                token = await get_or_create_user(pool, user_id, username, name)
+                token, _ = await get_or_create_user(pool, user_id, username, name)
 
             bot_username = (await bot.me()).username
             link = f"https://t.me/{bot_username}?start={token}"
@@ -89,7 +94,11 @@ async def start_handler(message: Message, command: CommandObject, state: FSMCont
             await message.answer("<b>⚠️ Noto‘g‘ri havola.</b>")
     else:
         # Regular /start command - show user's personal link
-        token = await get_or_create_user(pool, user_id, username, name)
+        token, is_new = await get_or_create_user(pool, user_id, username, name)
+        
+        # Notify admins about new user
+        if is_new:
+            await notify_admins_new_user(pool, bot, user_id, username, name)
 
         bot_username = (await bot.me()).username
         link = f"https://t.me/{bot_username}?start={token}"
@@ -119,17 +128,23 @@ async def handle_question(message: Message, state: FSMContext, bot: Bot, dispatc
     name = message.from_user.full_name
 
     # Get or create sender token
-    sender_token = await get_or_create_user(pool, user_id, username, name)
+    sender_token, _ = await get_or_create_user(pool, user_id, username, name)
 
     bot_username = (await bot.me()).username
     link = f"https://t.me/{bot_username}?start={sender_token}"
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="↩️ Javob berish", url=link)]
-    ])
-
+    
     try:
         if message.text:
-            # Text message
+            # Text message - store original text and token for back button
+            import base64
+            # Encode message text and token for callback data
+            message_text_encoded = base64.b64encode(message.text.encode('utf-8')).decode('utf-8')[:200]  # Limit length
+            token_encoded = base64.b64encode(sender_token.encode('utf-8')).decode('utf-8')
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Javob berish", url=link)],
+                [InlineKeyboardButton(text="👤 Kimdan", callback_data=f"reveal:sender:{user_id}:{token_encoded}:{message_text_encoded}")]
+            ])
+            
             await bot.send_message(
                 chat_id=target_id,
                 text=f"<b>📨 Sizga yangi anonim xabar bor!</b>\n\n{message.text}",
@@ -139,6 +154,14 @@ async def handle_question(message: Message, state: FSMContext, bot: Bot, dispatc
 
         else:
             # Media messages (photo, video, voice, document)
+            # Store token for back button
+            import base64
+            token_encoded = base64.b64encode(sender_token.encode('utf-8')).decode('utf-8')
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Javob berish", url=link)],
+                [InlineKeyboardButton(text="👤 Kimdan", callback_data=f"reveal:sender:{user_id}:{token_encoded}:media")]
+            ])
+            
             if message.photo:
                 await bot.send_photo(
                     target_id,
@@ -254,6 +277,10 @@ async def send_info(message: Message, bot: Bot, dispatcher):
         "• /find_chat komandasi yordamida tasodifiy foydalanuvchi bilan jonli suhbat boshlaysiz.\n"
         "• /end_chat orqali suhbatni yakunlashingiz mumkin.\n"
         "• Suhbat anonim tarzda kechadi, shaxsiy ma'lumotlar oshkor qilinmaydi.\n\n"
+        "<b>4️⃣ Premium rejasi</b>\n"
+        "• /premium komandasi orqali premium rejangizni ko'rishingiz va sotib olishingiz mumkin.\n"
+        "• Premium rejada turli xil imtiyozlar va qo'shimcha funksiyalar mavjud.\n"
+        "• Balansingizni to'ldirish uchun do'stlaringizni taklif qiling va har bir taklif uchun 10 so'm bonus oling.\n\n"
         f"<b>🔗 Qo'shimcha yordam</b>\n"
         f"Agar sizga yordam kerak bo'lsa yoki xatolik yuz bersa, admin bilan bog'laning: <a href='{ADMIN_URL}'>admin</a>"
     )
@@ -262,7 +289,7 @@ async def send_info(message: Message, bot: Bot, dispatcher):
 
 
 @user_router.message(Command("balance"))
-async def show_balance(message: Message, dispatcher):
+async def show_balance(message: Message, bot: Bot, dispatcher):
     """Handle /balance command - show user's current balance and total deposited."""
     pool = dispatcher["db"]
     user_id = message.from_user.id
@@ -270,8 +297,12 @@ async def show_balance(message: Message, dispatcher):
     # Ensure user exists in database
     username = message.from_user.username
     name = message.from_user.full_name
-    await get_or_create_user(pool, user_id, username, name)
-
+    _, is_new = await get_or_create_user(pool, user_id, username, name)
+    
+    # Notify admins about new user
+    if is_new:
+        await notify_admins_new_user(pool, bot, user_id, username, name)
+    
     # Get balance information
     balance, total_deposited = await get_user_balance_info(pool, user_id)
 
@@ -293,7 +324,7 @@ async def show_balance(message: Message, dispatcher):
 
 
 @user_router.message(Command("premium"))
-async def show_premium_status(message: Message, dispatcher):
+async def show_premium_status(message: Message, bot: Bot, dispatcher):
     """Handle /premium command - show user's premium status, plan, and balance."""
     pool = dispatcher["db"]
     user_id = message.from_user.id
@@ -301,8 +332,12 @@ async def show_premium_status(message: Message, dispatcher):
     # Ensure user exists in database
     username = message.from_user.username
     name = message.from_user.full_name
-    await get_or_create_user(pool, user_id, username, name)
-
+    _, is_new = await get_or_create_user(pool, user_id, username, name)
+    
+    # Notify admins about new user
+    if is_new:
+        await notify_admins_new_user(pool, bot, user_id, username, name)
+    
     # Get premium information
     premium_info = await get_user_premium_info(pool, user_id)
 
@@ -346,7 +381,7 @@ async def show_premium_status(message: Message, dispatcher):
                     plan_name = VALID_PLANS.get(subscription['plan'], subscription['plan'])
 
                     premium_text = (
-                        f"<b>⭐ Premium Status</b>\n\n"
+                        f"<b>💎 Premium Status</b>\n\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"✅ <b>Premium:</b> <code>Faol</code>\n"
                         f"📦 <b>Plan:</b> <code>{plan_name}</code>\n"
@@ -358,7 +393,7 @@ async def show_premium_status(message: Message, dispatcher):
                 else:
                     # Subscription expired
                     premium_text = (
-                        f"<b>⭐ Premium Status</b>\n\n"
+                        f"<b>💎 Premium Status</b>\n\n"
                         f"━━━━━━━━━━━━━━━━━━━━\n"
                         f"❌ <b>Premium:</b> <code>Muddati tugagan</code>\n"
                         f"📅 <b>Tugash sanasi:</b> <code>{end_date.strftime('%Y-%m-%d %H:%M')}</code>\n"
@@ -369,7 +404,7 @@ async def show_premium_status(message: Message, dispatcher):
                     )
             else:
                 premium_text = (
-                    f"<b>⭐ Premium Status</b>\n\n"
+                    f"<b>💎 Premium Status</b>\n\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"✅ <b>Premium:</b> <code>Faol</code>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -377,7 +412,7 @@ async def show_premium_status(message: Message, dispatcher):
                 )
         else:
             premium_text = (
-                f"<b>⭐ Premium Status</b>\n\n"
+                f"<b>💎 Premium Status</b>\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"✅ <b>Premium:</b> <code>Faol</code>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -386,7 +421,7 @@ async def show_premium_status(message: Message, dispatcher):
     else:
         # User is not premium - show available plans and balance
         premium_text = (
-            f"<b>⭐ Premium Status</b>\n\n"
+            f"<b>💎 Premium Status</b>\n\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"❌ <b>Premium:</b> <code>Faol emas</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -395,7 +430,7 @@ async def show_premium_status(message: Message, dispatcher):
         )
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="⭐ Premium sotib olish", callback_data="premium:purchase")],
+            [InlineKeyboardButton(text="💎 Premium sotib olish", callback_data="premium:purchase")],
             [InlineKeyboardButton(text="💰 Balansni to'ldirish", callback_data="topup:show_referral")]
         ])
         await message.answer(premium_text, parse_mode='HTML', reply_markup=keyboard)
@@ -406,6 +441,153 @@ async def show_premium_status(message: Message, dispatcher):
         [InlineKeyboardButton(text="💰 Balansni to'ldirish", callback_data="topup:show_referral")]
     ])
     await message.answer(premium_text, parse_mode='HTML', reply_markup=keyboard)
+
+
+@user_router.message(Command("profile"))
+async def show_profile(message: Message, bot: Bot, dispatcher):
+    """Handle /profile command - show user's profile information."""
+    pool = dispatcher["db"]
+    user_id = message.from_user.id
+    
+    # Ensure user exists in database
+    username = message.from_user.username
+    name = message.from_user.full_name
+    _, is_new = await get_or_create_user(pool, user_id, username, name)
+    
+    # Notify admins about new user
+    if is_new:
+        await notify_admins_new_user(pool, bot, user_id, username, name)
+    
+    # Get user information
+    async with pool.acquire() as conn:
+        user_info = await conn.fetchrow("""
+            SELECT 
+                user_id, username, name, token, is_premium, balance, 
+                total_deposited, referral_code, created_at, is_hidden
+            FROM users 
+            WHERE user_id = $1
+        """, user_id)
+    
+    if not user_info:
+        await message.answer("<b>⚠️ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.</b>")
+        return
+    
+    # Get premium info for subscription details
+    premium_info = await get_user_premium_info(pool, user_id)
+    subscription = premium_info.get('subscription') if premium_info else None
+    
+    # Build profile text (excluding is_admin and is_superuser)
+    profile_text = (
+        f"<b>👤 Profil</b>\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 <b>ID:</b> <code>{user_info['user_id']}</code>\n"
+        f"📛 <b>Ism:</b> {user_info['name']}\n"
+    )
+    
+    if user_info['username']:
+        profile_text += f"👤 <b>Username:</b> @{user_info['username']}\n"
+    else:
+        profile_text += f"👤 <b>Username:</b> Yo'q\n"
+    
+    profile_text += f"🗓 <b>Ro'yxatdan o'tgan:</b> {user_info['created_at']:%Y-%m-%d %H:%M}\n\n"
+    
+    profile_text += (
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>💰 Balans ma'lumotlari</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 <b>Joriy balans:</b> {user_info['balance']:,.2f} so'm\n"
+        f"📊 <b>Jami yuklangan:</b> {user_info['total_deposited']:,.2f} so'm\n\n"
+    )
+    
+    profile_text += (
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>💎 Premium ma'lumotlari</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💎 <b>Premium:</b> {'✅ Faol' if user_info['is_premium'] else '❌ Faol emas'}\n"
+    )
+    
+    if subscription:
+        plan_name = VALID_PLANS.get(subscription['plan'], subscription['plan'])
+        profile_text += f"📦 <b>Plan:</b> {plan_name}\n"
+        profile_text += f"📅 <b>Boshlanish:</b> {subscription['start_date']:%Y-%m-%d %H:%M}\n"
+        profile_text += f"📅 <b>Tugash:</b> {subscription['end_date']:%Y-%m-%d %H:%M}\n"
+    else:
+        profile_text += f"📦 <b>Plan:</b> Yo'q\n"
+    
+    profile_text += f"\n"
+    
+    if user_info['referral_code']:
+        profile_text += (
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>🎁 Referral</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔑 <b>Referral kodi:</b> <code>{user_info['referral_code']}</code>\n\n"
+        )
+    
+    if user_info['is_hidden']:
+        profile_text += f"🔒 <b>Profil holati:</b> Anonim (Premium obunachilar ham sizni tanib ololmaydi)\n"
+    else:
+        profile_text += f"🔓 <b>Profil holati:</b> Ochiq\n"
+    
+    # Add button to make profile anonymous
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔒 Profilni anonimlashtirish", callback_data="profile:make_anonymous")]
+    ])
+    
+    await message.answer(profile_text, parse_mode='HTML', reply_markup=keyboard)
+
+
+@user_router.callback_query(F.data == "profile:make_anonymous")
+async def make_profile_anonymous(callback: CallbackQuery, bot: Bot, dispatcher):
+    """Handle making profile anonymous - only works for premium users."""
+    pool = dispatcher["db"]
+    user_id = callback.from_user.id
+    
+    # Check if user is premium
+    is_premium = await is_user_premium(pool, user_id)
+    
+    if is_premium:
+        # User is premium - set is_hidden to True
+        success = await set_user_hidden(pool, user_id)
+        
+        if success:
+            await callback.message.edit_text(
+                "<b>🔒 Profil anonimlashtirildi</b>\n\n"
+                "✅ Endi hatto Premium obunachilar ham sizni tanib ololmaydi.\n"
+                "Sizning profil ma'lumotlaringiz boshqalar uchun yashirin.",
+                parse_mode='HTML'
+            )
+            await callback.answer("✅ Profil anonimlashtirildi!")
+        else:
+            await callback.answer("⚠️ Xatolik yuz berdi.", show_alert=True)
+    else:
+        # User is not premium - show premium purchase message
+        premium_info = await get_user_premium_info(pool, user_id)
+        
+        if premium_info is None:
+            await callback.answer("⚠️ Xatolik yuz berdi.", show_alert=True)
+            return
+        
+        balance = premium_info.get('balance', 0.00)
+        
+        # Show the same message format as /premium command when user is not premium
+        premium_text = (
+            f"<b>💎 Premium Status</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"❌ <b>Premium:</b> <code>Faol emas</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 <b>Balans:</b> <code>{balance:,.2f} so'm</code>\n\n"
+            f"💡 <b>Profilni anonimlashtirish uchun Premium rejaga o'ting.</b>\n\n"
+            f"💡 <b>Premiumga o'tish uchun plan tanlang va to'lov qiling.</b>"
+        )
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Premium sotib olish", callback_data="premium:purchase")],
+            [InlineKeyboardButton(text="💰 Balansni to'ldirish", callback_data="topup:show_referral")]
+        ])
+        
+        await callback.message.edit_text(premium_text, parse_mode='HTML', reply_markup=keyboard)
+        await callback.answer()
 
 
 # ==================== PREMIUM PURCHASE FLOW ====================
@@ -467,7 +649,7 @@ async def back_to_premium_status(callback: CallbackQuery, dispatcher):
         return
 
     premium_text = (
-        f"<b>⭐ Premium Status</b>\n\n"
+        f"<b>💎 Premium Status</b>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"❌ <b>Premium:</b> <code>Faol emas</code>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -476,7 +658,7 @@ async def back_to_premium_status(callback: CallbackQuery, dispatcher):
     )
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Premium sotib olish", callback_data="premium:purchase")]
+        [InlineKeyboardButton(text="💎 Premium sotib olish", callback_data="premium:purchase")]
     ])
 
     # Add top up button to premium status
@@ -538,9 +720,10 @@ async def select_plan(callback: CallbackQuery, dispatcher):
             f"💰 <b>Narx:</b> <code>{price:,.2f} so'm</code>\n"
             f"💵 <b>Joriy balans:</b> <code>{balance:,.2f} so'm</code>\n"
             f"❌ <b>Yetishmaydi:</b> <code>{needed:,.2f} so'm</code>\n\n"
-            f"💡 Balansni to'ldirish uchun admin bilan bog'laning.",
+            f"💡 Balansni to'ldirish kerak.",
             parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="💰 Balansni to'ldirish", callback_data="topup:show_referral")],
                 [InlineKeyboardButton(text="🔙 Orqaga", callback_data="premium:purchase")]
             ])
         )
@@ -558,7 +741,11 @@ async def show_referral_code(callback: CallbackQuery, bot: Bot, dispatcher):
     # Ensure user exists
     username = callback.from_user.username
     name = callback.from_user.full_name
-    await get_or_create_user(pool, user_id, username, name)
+    _, is_new = await get_or_create_user(pool, user_id, username, name)
+    
+    # Notify admins about new user
+    if is_new:
+        await notify_admins_new_user(pool, bot, user_id, username, name)
 
     # Get or generate referral code
     referral_code = await generate_referral_code(pool, user_id)
@@ -589,3 +776,157 @@ async def show_referral_code(callback: CallbackQuery, bot: Bot, dispatcher):
 
     await callback.message.edit_text(referral_text, parse_mode='HTML', reply_markup=keyboard)
     await callback.answer()
+
+
+# ==================== REVEAL SENDER ====================
+
+@user_router.callback_query(F.data.startswith("reveal:sender:"))
+async def reveal_sender(callback: CallbackQuery, bot: Bot, dispatcher):
+    """Handle reveal sender button - check receiver's premium and show profile or premium message."""
+    pool = dispatcher["db"]
+    receiver_id = callback.from_user.id
+    
+    # Parse callback data: reveal:sender:sender_id:token_encoded:message_text_encoded
+    parts = callback.data.split(":")
+    sender_id = int(parts[2])
+    token_encoded = parts[3] if len(parts) > 3 else None
+    message_data = parts[4] if len(parts) > 4 else None
+    
+    # Check if RECEIVER (the person clicking the button) is premium
+    receiver_is_premium = await is_user_premium(pool, receiver_id)
+    
+    if receiver_is_premium:
+        # Receiver is premium - show sender's Telegram profile link
+        # Get sender's info
+        async with pool.acquire() as conn:
+            sender_row = await conn.fetchrow(
+                "SELECT name, username FROM users WHERE user_id = $1",
+                sender_id
+            )
+        
+        if not sender_row:
+            await callback.answer("❌ Foydalanuvchi topilmadi.", show_alert=True)
+            return
+        
+        sender_name = sender_row['name']
+        sender_username = f"@{sender_row['username']}" if sender_row['username'] else "Yo'q"
+            
+        profile_text = (
+            f"👤 <b>Xabar yuboruvchi</b>\n\n"
+            f"📛 <b>Ism:</b> {sender_name}\n"
+            f"📱 <b>Username:</b> {sender_username}\n"
+        )
+        
+        # Create back button with original message data if available
+        if message_data and message_data != "media" and token_encoded:
+            back_data = f"reveal:back:{sender_id}:{token_encoded}:{message_data}"
+        elif token_encoded:
+            back_data = f"reveal:back:{sender_id}:{token_encoded}:media"
+        else:
+            back_data = "reveal:back:media"
+        
+        # Try to create profile link button, but handle privacy restrictions
+        sender_link = f"tg://user?id={sender_id}"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Profilni ko'rish", url=sender_link)],
+            [InlineKeyboardButton(text="↩️ Orqaga", callback_data=back_data)]
+        ])
+        
+        try:
+            await callback.message.edit_text(profile_text, parse_mode='HTML', reply_markup=keyboard)
+        except TelegramBadRequest as e:
+            # If profile link is restricted by privacy settings, show info without button
+            error_str = str(e).upper()
+            error_message = getattr(e, 'message', '')
+            if error_message:
+                error_str += " " + str(error_message).upper()
+            
+            if "BUTTON_USER_PRIVACY_RESTRICTED" in error_str or "PRIVACY_RESTRICTED" in error_str:
+                profile_text += "\n\n⚠️ <i>Foydalanuvchi profiliga kirish cheklangan (privacy settings).</i>"
+                keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="↩️ Orqaga", callback_data=back_data)]
+                ])
+                await callback.message.edit_text(profile_text, parse_mode='HTML', reply_markup=keyboard)
+            else:
+                # Re-raise if it's a different error
+                raise
+        
+        await callback.answer()
+    else:
+        # Receiver is NOT premium - show premium purchase message (like /premium command)
+        receiver_info = await get_user_premium_info(pool, receiver_id)
+        
+        if receiver_info is None:
+            await callback.answer("⚠️ Xatolik yuz berdi.", show_alert=True)
+            return
+        
+        receiver_balance = receiver_info.get('balance', 0.00)
+        
+        # Show the same message format as /premium command when user is not premium
+        premium_text = (
+            f"<b>💎 Premium Status</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"❌ <b>Premium:</b> <code>Faol emas</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💰 <b>Balans:</b> <code>{receiver_balance:,.2f} so'm</code>\n\n"
+            f"💡 <b>Xabar yuboruvchini ko'rish uchun Premium rejaga o'ting.</b>\n\n"
+            f"💡 <b>Premiumga o'tish uchun plan tanlang va to'lov qiling.</b>"
+        )
+        
+        # Create back button with original message data if available
+        if message_data and message_data != "media" and token_encoded:
+            back_data = f"reveal:back:{sender_id}:{token_encoded}:{message_data}"
+        elif token_encoded:
+            back_data = f"reveal:back:{sender_id}:{token_encoded}:media"
+        else:
+            back_data = "reveal:back:media"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💎 Premium sotib olish", callback_data="premium:purchase")],
+            [InlineKeyboardButton(text="💰 Balansni to'ldirish", callback_data="topup:show_referral")],
+            [InlineKeyboardButton(text="↩️ Orqaga", callback_data=back_data)]
+        ])
+        
+        await callback.message.edit_text(premium_text, parse_mode='HTML', reply_markup=keyboard)
+        await callback.answer()
+
+
+@user_router.callback_query(F.data.startswith("reveal:back:"))
+async def reveal_back(callback: CallbackQuery, bot: Bot):
+    """Go back from reveal sender screen - restore original message."""
+    import base64
+    
+    parts = callback.data.split(":")
+    if len(parts) >= 5:
+        # Restore text message
+        try:
+            sender_id = int(parts[2])
+            token_encoded = parts[3]
+            message_text_encoded = parts[4]
+            
+            # Decode token and message
+            sender_token = base64.b64decode(token_encoded).decode('utf-8')
+            message_text = base64.b64decode(message_text_encoded).decode('utf-8')
+            
+            bot_username = (await bot.me()).username
+            link = f"https://t.me/{bot_username}?start={sender_token}"
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Javob berish", url=link)],
+                [InlineKeyboardButton(text="👤 Kimdan", callback_data=f"reveal:sender:{sender_id}:{token_encoded}:{message_text_encoded}")]
+            ])
+
+
+            await callback.message.edit_text(
+                f"<b>📨 Sizga yangi anonim xabar bor!</b>\n\n{message_text}",
+                reply_markup=keyboard,
+                parse_mode='HTML'
+            )
+            await callback.answer()
+        except Exception as e:
+            await callback.answer("ℹ️ Xabarni ko'rish uchun chat tarixini tekshiring.", show_alert=True)
+    elif len(parts) >= 4 and parts[3] == "media":
+        # Media message - can't restore easily, show helpful message
+        await callback.answer("ℹ️ Media xabarni ko'rish uchun chat tarixini tekshiring.", show_alert=True)
+    else:
+        await callback.answer("ℹ️ Xabarni ko'rish uchun chat tarixini tekshiring.", show_alert=True)

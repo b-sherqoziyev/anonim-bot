@@ -49,7 +49,12 @@ async def find_chat_handler(message: Message, state: FSMContext, bot: Bot, dispa
         return
 
     # Ensure user exists in database
-    await get_or_create_user(pool, user_id, username, name)
+    _, is_new = await get_or_create_user(pool, user_id, username, name)
+    
+    # Notify admins about new user
+    if is_new:
+        from db import notify_admins_new_user
+        await notify_admins_new_user(pool, bot, user_id, username, name)
 
     # Try to add to queue
     added, status = await add_to_chat_queue(pool, user_id)
@@ -141,7 +146,12 @@ async def deliver_chat_message(message: Message, state: FSMContext, bot: Bot, di
     name = message.from_user.full_name
 
     # Ensure user exists in database
-    await get_or_create_user(pool, user_id, username, name)
+    _, is_new = await get_or_create_user(pool, user_id, username, name)
+    
+    # Notify admins about new user
+    if is_new:
+        from db import notify_admins_new_user
+        await notify_admins_new_user(pool, bot, user_id, username, name)
 
     try:
         if message.text:

@@ -3,11 +3,11 @@ Admin handlers module.
 Handles admin panel, ban/unban, broadcast, statistics, live chat monitoring, and settings.
 """
 from aiogram import Router, F, Bot
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import asyncio
@@ -22,9 +22,16 @@ from db import (
     get_banned_users_count,
     admin_end_chat_by_id,
     log_admin_action,
-    end_chat
+    end_chat,
+    get_user_full_info,
+    get_user_payment_history,
+    VALID_PLANS,
+    PAYMENT_STATUSES,
+    PAYMENT_METHOD_NAMES,
+    log_message,
+    get_or_create_user
 )
-from states import BanState, BroadcastState, SearchUserState
+from states import BanState, BroadcastState, SearchUserState, AdminMessageState
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -48,12 +55,30 @@ async def safe_edit_text(callback: CallbackQuery, text: str, reply_markup=None, 
 def get_main_menu_keyboard():
     """Get main admin panel menu keyboard."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin:broadcast")],
+        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin:broadcast_options")],
         [InlineKeyboardButton(text="📊 Statistika", callback_data="admin:stats")],
         [InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="admin:users")],
         [InlineKeyboardButton(text="💬 Live chat monitoring", callback_data="admin:live_chats")],
         [InlineKeyboardButton(text="⚙️ Settings", callback_data="admin:settings")],
     ])
+
+
+@admin_router.callback_query(F.data == "admin:main")
+async def admin_panel_main(callback: CallbackQuery, bot: Bot, dispatcher):
+    """Return to admin panel main menu."""
+    pool = dispatcher["db"]
+    user_id = callback.from_user.id
+
+    if not await is_user_admin(pool, user_id):
+        await callback.answer("❌ Sizda admin huquqi yo'q.", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "<b>👨‍💻 Admin panelga xush kelibsiz!</b>\nQuyidagilardan birini tanlang:",
+        reply_markup=get_main_menu_keyboard(),
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer()
 
 
 @admin_router.message(Command("admin"))
@@ -246,15 +271,13 @@ async def show_user_info(message: Message, state: FSMContext, bot: Bot, dispatch
         await message.answer("❌ Noto'g'ri ID format. Iltimos, faqat raqam yuboring.")
         return
 
-    async with pool.acquire() as conn:
-        user = await conn.fetchrow(
-            "SELECT user_id, username, name, is_admin, created_at FROM users WHERE user_id = $1",
-            user_id
-        )
-        if not user:
-            await message.answer("😕 Bunday foydalanuvchi topilmadi.")
-            return
+    # Get comprehensive user info
+    user_info = await get_user_full_info(pool, user_id)
+    if not user_info:
+        await message.answer("😕 Bunday foydalanuvchi topilmadi.")
+        return
 
+    async with pool.acquire() as conn:
         banned_row = await conn.fetchrow("SELECT user_id FROM muted_users WHERE user_id = $1", user_id)
         # Check if in active chat
         chat_row = await conn.fetchrow("""
@@ -268,15 +291,63 @@ async def show_user_info(message: Message, state: FSMContext, bot: Bot, dispatch
     if chat_row:
         partner_id = chat_row["user2_id"] if chat_row["user1_id"] == user_id else chat_row["user1_id"]
 
-    text = (
-        f"👤 <b>Foydalanuvchi haqida:</b>\n\n"
-        f"🆔 ID: <code>{user['user_id']}</code>\n"
-        f"📛 Ism: {user['name']}\n"
-        f"🗓 Ro'yxatdan o'tgan: {user['created_at']:%Y-%m-%d %H:%M}\n"
-        f"🛡 Admin: {'✅' if user['is_admin'] else '❌'}\n"
-        f"🔇 Blok: {'✅' if is_banned else '❌'}\n"
-        f"💬 Chatda: {'✅' if in_chat else '❌'}"
-    )
+    # Build comprehensive user info text
+    text = f"👤 <b>Foydalanuvchi ma'lumotlari</b>\n\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"🆔 <b>ID:</b> <code>{user_info['user_id']}</code>\n"
+    text += f"📛 <b>Ism:</b> {user_info['name']}\n"
+    if user_info['username']:
+        text += f"👤 <b>Username:</b> @{user_info['username']}\n"
+    text += f"🗓 <b>Ro'yxatdan o'tgan:</b> {user_info['created_at']:%Y-%m-%d %H:%M}\n"
+    text += f"🛡 <b>Admin:</b> {'✅' if user_info['is_admin'] else '❌'}\n"
+    text += f"👑 <b>Superuser:</b> {'✅' if user_info['is_superuser'] else '❌'}\n"
+    text += f"🔇 <b>Blok:</b> {'✅' if is_banned else '❌'}\n"
+    text += f"💬 <b>Chatda:</b> {'✅' if in_chat else '❌'}\n\n"
+    
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"<b>💰 Balans ma'lumotlari</b>\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"💵 <b>Joriy balans:</b> {user_info['balance']:,.2f} so'm\n"
+    text += f"📊 <b>Jami yuklangan:</b> {user_info['total_deposited']:,.2f} so'm\n\n"
+    
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"<b>💎 Premium ma'lumotlari</b>\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"💎 <b>Premium:</b> {'✅ Faol' if user_info['is_premium'] else '❌ Faol emas'}\n"
+    
+    if user_info['subscription']:
+        sub = user_info['subscription']
+        plan_name = VALID_PLANS.get(sub['plan'], sub['plan'])
+        text += f"📦 <b>Plan:</b> {plan_name}\n"
+        text += f"📅 <b>Boshlanish:</b> {sub['start_date']:%Y-%m-%d %H:%M}\n"
+        text += f"📅 <b>Tugash:</b> {sub['end_date']:%Y-%m-%d %H:%M}\n"
+        text += f"🔄 <b>Faol:</b> {'✅' if sub['is_active'] else '❌'}\n"
+    else:
+        text += f"📦 <b>Plan:</b> Yo'q\n"
+    text += f"\n"
+    
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"<b>🎁 Referral ma'lumotlari</b>\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    if user_info['referral_code']:
+        text += f"🔑 <b>Referral kodi:</b> <code>{user_info['referral_code']}</code>\n"
+    else:
+        text += f"🔑 <b>Referral kodi:</b> Yo'q\n"
+    text += f"👥 <b>Taklif qilingan:</b> {user_info['referral_count']} ta\n"
+    text += f"💰 <b>Referral daromadi:</b> {user_info['referral_earnings']:,.2f} so'm\n"
+    if user_info['referrer_name']:
+        text += f"👤 <b>Taklif qilgan:</b> {user_info['referrer_name']} (ID: {user_info.get('referral_by', 'N/A')})\n"
+    else:
+        text += f"👤 <b>Taklif qilgan:</b> Yo'q\n"
+    text += f"\n"
+    
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"<b>📊 Faollik</b>\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    if user_info['last_activity']:
+        text += f"🕐 <b>Oxirgi faollik:</b> {user_info['last_activity']:%Y-%m-%d %H:%M}\n"
+    else:
+        text += f"🕐 <b>Oxirgi faollik:</b> Ma'lumot yo'q\n"
 
     buttons = []
     if is_banned:
@@ -295,6 +366,25 @@ async def show_user_info(message: Message, state: FSMContext, bot: Bot, dispatch
             text="💬 Chatni tugatish",
             callback_data=f"admin:end_user_chat:{user_id}"
         )])
+    
+    # Add profile button
+    user_profile_link = f"tg://user?id={user_id}"
+    buttons.append([InlineKeyboardButton(
+        text="👤 Profilni ko'rish",
+        url=user_profile_link
+    )])
+    
+    # Add payment history button
+    buttons.append([InlineKeyboardButton(
+        text="💳 To'lovlar tarixi",
+        callback_data=f"admin:payment_history:{user_id}"
+    )])
+    
+    # Add anonymous message button
+    buttons.append([InlineKeyboardButton(
+        text="📨 Anonim xabar yuborish",
+        callback_data=f"admin:send_message:{user_id}"
+    )])
 
     buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:users")])
 
@@ -405,16 +495,14 @@ async def select_user(callback: CallbackQuery, bot: Bot, dispatcher):
     pool = dispatcher["db"]
     user_id = int(callback.data.split(":")[-1])
 
-    async with pool.acquire() as conn:
-        user = await conn.fetchrow(
-            "SELECT user_id, username, name, is_admin, created_at FROM users WHERE user_id = $1",
-            user_id
-        )
-        if not user:
-            await callback.message.edit_text("😕 Bunday foydalanuvchi topilmadi.", parse_mode=ParseMode.HTML)
-            await callback.answer()
-            return
+    # Get comprehensive user info
+    user_info = await get_user_full_info(pool, user_id)
+    if not user_info:
+        await callback.message.edit_text("😕 Bunday foydalanuvchi topilmadi.", parse_mode=ParseMode.HTML)
+        await callback.answer()
+        return
 
+    async with pool.acquire() as conn:
         banned_row = await conn.fetchrow("SELECT user_id FROM muted_users WHERE user_id = $1", user_id)
         chat_row = await conn.fetchrow("""
             SELECT user1_id, user2_id FROM chat_connections 
@@ -427,15 +515,63 @@ async def select_user(callback: CallbackQuery, bot: Bot, dispatcher):
     if chat_row:
         partner_id = chat_row["user2_id"] if chat_row["user1_id"] == user_id else chat_row["user1_id"]
 
-    text = (
-        f"👤 <b>Foydalanuvchi haqida:</b>\n\n"
-        f"🆔 ID: <code>{user['user_id']}</code>\n"
-        f"📛 Ism: {user['name']}\n"
-        f"🗓 Ro'yxatdan o'tgan: {user['created_at']:%Y-%m-%d %H:%M}\n"
-        f"🛡 Admin: {'✅' if user['is_admin'] else '❌'}\n"
-        f"🔇 Blok: {'✅' if is_banned else '❌'}\n"
-        f"💬 Chatda: {'✅' if in_chat else '❌'}"
-    )
+    # Build comprehensive user info text
+    text = f"👤 <b>Foydalanuvchi ma'lumotlari</b>\n\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"🆔 <b>ID:</b> <code>{user_info['user_id']}</code>\n"
+    text += f"📛 <b>Ism:</b> {user_info['name']}\n"
+    if user_info['username']:
+        text += f"👤 <b>Username:</b> @{user_info['username']}\n"
+    text += f"🗓 <b>Ro'yxatdan o'tgan:</b> {user_info['created_at']:%Y-%m-%d %H:%M}\n"
+    text += f"🛡 <b>Admin:</b> {'✅' if user_info['is_admin'] else '❌'}\n"
+    text += f"👑 <b>Superuser:</b> {'✅' if user_info['is_superuser'] else '❌'}\n"
+    text += f"🔇 <b>Blok:</b> {'✅' if is_banned else '❌'}\n"
+    text += f"💬 <b>Chatda:</b> {'✅' if in_chat else '❌'}\n\n"
+    
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"<b>💰 Balans ma'lumotlari</b>\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"💵 <b>Joriy balans:</b> {user_info['balance']:,.2f} so'm\n"
+    text += f"📊 <b>Jami yuklangan:</b> {user_info['total_deposited']:,.2f} so'm\n\n"
+    
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"<b>💎 Premium ma'lumotlari</b>\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"💎 <b>Premium:</b> {'✅ Faol' if user_info['is_premium'] else '❌ Faol emas'}\n"
+    
+    if user_info['subscription']:
+        sub = user_info['subscription']
+        plan_name = VALID_PLANS.get(sub['plan'], sub['plan'])
+        text += f"📦 <b>Plan:</b> {plan_name}\n"
+        text += f"📅 <b>Boshlanish:</b> {sub['start_date']:%Y-%m-%d %H:%M}\n"
+        text += f"📅 <b>Tugash:</b> {sub['end_date']:%Y-%m-%d %H:%M}\n"
+        text += f"🔄 <b>Faol:</b> {'✅' if sub['is_active'] else '❌'}\n"
+    else:
+        text += f"📦 <b>Plan:</b> Yo'q\n"
+    text += f"\n"
+    
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"<b>🎁 Referral ma'lumotlari</b>\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    if user_info['referral_code']:
+        text += f"🔑 <b>Referral kodi:</b> <code>{user_info['referral_code']}</code>\n"
+    else:
+        text += f"🔑 <b>Referral kodi:</b> Yo'q\n"
+    text += f"👥 <b>Taklif qilingan:</b> {user_info['referral_count']} ta\n"
+    text += f"💰 <b>Referral daromadi:</b> {user_info['referral_earnings']:,.2f} so'm\n"
+    if user_info['referrer_name']:
+        text += f"👤 <b>Taklif qilgan:</b> {user_info['referrer_name']} (ID: {user_info.get('referral_by', 'N/A')})\n"
+    else:
+        text += f"👤 <b>Taklif qilgan:</b> Yo'q\n"
+    text += f"\n"
+    
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"<b>📊 Faollik</b>\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━\n"
+    if user_info['last_activity']:
+        text += f"🕐 <b>Oxirgi faollik:</b> {user_info['last_activity']:%Y-%m-%d %H:%M}\n"
+    else:
+        text += f"🕐 <b>Oxirgi faollik:</b> Ma'lumot yo'q\n"
 
     buttons = []
     if is_banned:
@@ -454,9 +590,231 @@ async def select_user(callback: CallbackQuery, bot: Bot, dispatcher):
             text="💬 Chatni tugatish",
             callback_data=f"admin:end_user_chat:{user_id}"
         )])
+    
+    # Add profile button
+    user_profile_link = f"tg://user?id={user_id}"
+    buttons.append([InlineKeyboardButton(
+        text="👤 Profilni ko'rish",
+        url=user_profile_link
+    )])
+    
+    # Add payment history button
+    buttons.append([InlineKeyboardButton(
+        text="💳 To'lovlar tarixi",
+        callback_data=f"admin:payment_history:{user_id}"
+    )])
+    
+    # Add anonymous message button
+    buttons.append([InlineKeyboardButton(
+        text="📨 Anonim xabar yuborish",
+        callback_data=f"admin:send_message:{user_id}"
+    )])
 
     buttons.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:recent_users:1")])
 
+    await callback.message.edit_text(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("admin:send_message:"))
+async def start_admin_message(callback: CallbackQuery, state: FSMContext):
+    """Start the flow for admin to send anonymous message to a user."""
+    user_id = int(callback.data.split(":")[-1])
+    
+    # Store target user ID in state
+    await state.update_data(target_id=user_id)
+    await state.set_state(AdminMessageState.waiting_for_message)
+    
+    await callback.message.edit_text(
+        "<b>📨 Anonim xabar yuborish</b>\n\n"
+        "Xabarni yuboring (matn, rasm, video, ovoz yoki hujjat):",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin:cancel_message")]
+        ])
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data == "admin:cancel_message")
+async def cancel_admin_message(callback: CallbackQuery, state: FSMContext):
+    """Cancel sending anonymous message."""
+    await state.clear()
+    await callback.message.edit_text(
+        "<b>❌ Xabar yuborish bekor qilindi.</b>",
+        parse_mode=ParseMode.HTML
+    )
+    await callback.answer("❌ Bekor qilindi.")
+
+
+@admin_router.message(AdminMessageState.waiting_for_message)
+async def handle_admin_message(message: Message, state: FSMContext, bot: Bot, dispatcher):
+    """Handle admin's anonymous message and send it to target user."""
+    pool = dispatcher["db"]
+    data = await state.get_data()
+    target_id = data.get("target_id")
+    
+    if not target_id:
+        await message.answer("❌ Xatolik: Foydalanuvchi ID topilmadi.")
+        await state.clear()
+        return
+    
+    admin_id = message.from_user.id
+    admin_username = message.from_user.username
+    admin_name = message.from_user.full_name
+    
+    # Get or create admin user (for token)
+    admin_token, _ = await get_or_create_user(pool, admin_id, admin_username, admin_name)
+    
+    bot_username = (await bot.me()).username
+    link = f"https://t.me/{bot_username}?start={admin_token}"
+    
+    try:
+        if message.text:
+            # Text message
+            import base64
+            message_text_encoded = base64.b64encode(message.text.encode('utf-8')).decode('utf-8')[:200]
+            token_encoded = base64.b64encode(admin_token.encode('utf-8')).decode('utf-8')
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Javob berish", url=link)],
+                [InlineKeyboardButton(text="👤 Kimdan", callback_data=f"reveal:sender:{admin_id}:{token_encoded}:{message_text_encoded}")]
+            ])
+            
+            await bot.send_message(
+                chat_id=target_id,
+                text=f"<b>📨 Sizga yangi anonim xabar bor!</b>\n\n{message.text}",
+                reply_markup=keyboard
+            )
+            await log_message(pool, admin_id, target_id, message.text)
+            
+        else:
+            # Media messages
+            import base64
+            token_encoded = base64.b64encode(admin_token.encode('utf-8')).decode('utf-8')
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="↩️ Javob berish", url=link)],
+                [InlineKeyboardButton(text="👤 Kimdan", callback_data=f"reveal:sender:{admin_id}:{token_encoded}:media")]
+            ])
+            
+            if message.photo:
+                await bot.send_photo(
+                    target_id,
+                    message.photo[-1].file_id,
+                    caption="<b>📨 Sizga yangi anonim xabar bor!</b>",
+                    reply_markup=keyboard
+                )
+            elif message.video:
+                await bot.send_video(
+                    target_id,
+                    message.video.file_id,
+                    caption="<b>📨 Sizga yangi anonim xabar bor!</b>",
+                    reply_markup=keyboard
+                )
+            elif message.voice:
+                await bot.send_voice(
+                    target_id,
+                    message.voice.file_id,
+                    caption="<b>📨 Sizga yangi anonim xabar bor!</b>",
+                    reply_markup=keyboard
+                )
+            elif message.document:
+                await bot.send_document(
+                    target_id,
+                    message.document.file_id,
+                    caption="<b>📨 Sizga yangi anonim xabar bor!</b>",
+                    reply_markup=keyboard
+                )
+            else:
+                await message.answer("<b>⚠️ Ushbu turdagi xabar qo'llab-quvvatlanmaydi.</b>")
+                await state.clear()
+                return
+            
+            # Log media messages to log channel
+            sender_link = f'<a href="tg://user?id={admin_id}">{admin_name}</a>'
+            receiver_link = f'<a href="tg://user?id={target_id}">{target_id}</a>'
+            
+            log_caption = (
+                f"📥 <b>Yuboruvchi (Admin):</b> {sender_link}\n\n"
+                f"👤 <b>Qabul qiluvchi:</b> {receiver_link}"
+            )
+            
+            try:
+                if message.photo:
+                    await bot.send_photo(LOG_CHANNEL_ID, message.photo[-1].file_id, caption=log_caption, parse_mode='HTML')
+                elif message.video:
+                    await bot.send_video(LOG_CHANNEL_ID, message.video.file_id, caption=log_caption, parse_mode='HTML')
+                elif message.voice:
+                    await bot.send_voice(LOG_CHANNEL_ID, message.voice.file_id, caption=log_caption, parse_mode='HTML')
+                elif message.document:
+                    await bot.send_document(LOG_CHANNEL_ID, message.document.file_id, caption=log_caption, parse_mode='HTML')
+            except TelegramForbiddenError:
+                pass  # Log channel not accessible
+        
+        await message.answer("✅ Anonim xabar yuborildi!", reply_markup=ReplyKeyboardRemove())
+        await log_admin_action(pool, admin_id, "send_anonymous_message", f"Sent to user ID: {target_id}")
+        
+    except TelegramForbiddenError:
+        await message.answer("❌ Foydalanuvchi botni bloklagan yoki xabar yuborib bo'lmaydi.")
+    except Exception as e:
+        await message.answer(f"⚠️ Xatolik yuz berdi: {str(e)}")
+        logger.error(f"Error sending admin anonymous message: {e}", exc_info=True)
+    finally:
+        await state.clear()
+
+
+@admin_router.callback_query(F.data.startswith("admin:payment_history:"))
+async def show_payment_history(callback: CallbackQuery, dispatcher):
+    """Display payment history for a user."""
+    pool = dispatcher["db"]
+    user_id = int(callback.data.split(":")[-1])
+    
+    # Get user name
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT name FROM users WHERE user_id = $1", user_id)
+        if not user:
+            await callback.answer("❌ Foydalanuvchi topilmadi.", show_alert=True)
+            return
+    
+    # Get payment history
+    payments = await get_user_payment_history(pool, user_id, limit=50)
+    
+    if not payments:
+        text = f"💳 <b>To'lovlar tarixi</b>\n\n"
+        text += f"👤 <b>Foydalanuvchi:</b> {user['name']}\n"
+        text += f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        text += f"📭 To'lovlar mavjud emas."
+    else:
+        text = f"💳 <b>To'lovlar tarixi</b>\n\n"
+        text += f"👤 <b>Foydalanuvchi:</b> {user['name']}\n"
+        text += f"📊 <b>Jami to'lovlar:</b> {len(payments)} ta\n"
+        text += f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        total_amount = sum(float(p['amount']) for p in payments)
+        text += f"💰 <b>Jami summa:</b> {total_amount:,.2f} so'm\n\n"
+        text += f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        
+        for i, payment in enumerate(payments[:20], 1):  # Show last 20 payments
+            status_emoji = PAYMENT_STATUSES.get(payment['status'], payment['status'])
+            method_name = PAYMENT_METHOD_NAMES.get(payment['method'], payment['method'])
+            
+            text += f"<b>#{i}</b> | {payment['created_at']:%Y-%m-%d %H:%M}\n"
+            text += f"💰 {payment['amount']:,.2f} so'm | {method_name} | {status_emoji}\n"
+            if payment['transaction_id']:
+                text += f"🆔 <code>{payment['transaction_id'][:20]}...</code>\n"
+            text += f"\n"
+        
+        if len(payments) > 20:
+            text += f"\n... va yana {len(payments) - 20} ta to'lov"
+    
+    buttons = [
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"admin:select_user:{user_id}")]
+    ]
+    
     await callback.message.edit_text(
         text,
         parse_mode=ParseMode.HTML,
@@ -568,13 +926,38 @@ async def unban_user(message: Message, state: FSMContext, bot: Bot, dispatcher):
 
 # ==================== BROADCAST ====================
 
-@admin_router.callback_query(F.data == "admin:broadcast")
-async def start_broadcast(callback: CallbackQuery, state: FSMContext):
-    """Start broadcast message flow."""
-    await state.set_state(BroadcastState.waiting_for_message)
+@admin_router.callback_query(F.data == "admin:broadcast_options")
+async def show_broadcast_options(callback: CallbackQuery):
+    """Show broadcast options: all users or non-premium users only."""
     await callback.message.edit_text(
-        "<b>📢 Yubormoqchi bo'lgan xabaringizni yozing:</b>\n"
+        "<b>📢 Broadcast</b>\n\n"
+        "Kimlarga xabar yubormoqchisiz?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👥 Barcha foydalanuvchilar", callback_data="admin:broadcast:all")],
+            [InlineKeyboardButton(text="❌ Premium bo'lmaganlar", callback_data="admin:broadcast:non_premium")],
+            [InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:main")]
+        ])
+    )
+    await callback.answer()
+
+
+@admin_router.callback_query(F.data.startswith("admin:broadcast:"))
+async def start_broadcast(callback: CallbackQuery, state: FSMContext):
+    """Start broadcast message flow with selected target type."""
+    broadcast_type = callback.data.split(":")[-1]  # "all" or "non_premium"
+    
+    # Store broadcast type in state
+    await state.update_data(broadcast_type=broadcast_type)
+    await state.set_state(BroadcastState.waiting_for_message)
+    
+    target_text = "barcha foydalanuvchilar" if broadcast_type == "all" else "premium bo'lmagan foydalanuvchilar"
+    
+    await callback.message.edit_text(
+        f"<b>📢 Broadcast - {target_text.title()}</b>\n\n"
+        "Yubormoqchi bo'lgan xabaringizni yozing:\n"
         "Matn yoki rasm/video bilan matn ham bo'lishi mumkin.",
+        parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin:cancel_broadcast")]
         ])
@@ -595,19 +978,22 @@ async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
 
 @admin_router.message(BroadcastState.waiting_for_message)
 async def process_broadcast(message: Message, state: FSMContext, bot: Bot, dispatcher):
-    """Process and send broadcast message to all users."""
+    """Process and send broadcast message to selected users."""
     pool = dispatcher["db"]
     admin_id = message.from_user.id
+    data = await state.get_data()
+    broadcast_type = data.get("broadcast_type", "all")  # Default to "all" if not set
     await state.clear()
 
     # Show preview
-    preview_text = "<b>📢 Broadcast ko'rinishi:</b>\n\n"
+    target_text = "barcha foydalanuvchilar" if broadcast_type == "all" else "premium bo'lmagan foydalanuvchilar"
+    preview_text = f"<b>📢 Broadcast ko'rinishi ({target_text}):</b>\n\n"
     if message.text:
         preview_text += message.text
     else:
         preview_text += "Media xabar (rasm/video/voice/document)"
 
-    await message.answer(preview_text)
+    await message.answer(preview_text, parse_mode=ParseMode.HTML)
     await message.answer("<i>⏳ Xabar yuborilmoqda...</i>")
 
     success = 0
@@ -615,8 +1001,12 @@ async def process_broadcast(message: Message, state: FSMContext, bot: Bot, dispa
     batch_size = 30
     delay_between_batches = 1.0
 
+    # Get users based on broadcast type
     async with pool.acquire() as conn:
-        users = await conn.fetch("SELECT user_id FROM users")
+        if broadcast_type == "non_premium":
+            users = await conn.fetch("SELECT user_id FROM users WHERE is_premium = FALSE")
+        else:
+            users = await conn.fetch("SELECT user_id FROM users")
 
     total_users = len(users)
     for i in range(0, total_users, batch_size):
@@ -648,15 +1038,18 @@ async def process_broadcast(message: Message, state: FSMContext, bot: Bot, dispa
         if i + batch_size < total_users:
             await asyncio.sleep(delay_between_batches)
 
+    target_description = "barcha foydalanuvchilar" if broadcast_type == "all" else "premium bo'lmagan foydalanuvchilar"
+    
     await log_admin_action(
         pool, admin_id, "broadcast",
-        f"Sent to {success} users, failed: {fail}"
+        f"Sent to {success} users ({target_description}), failed: {fail}"
     )
 
     await message.answer(
         f"<b>✅ Broadcast yakunlandi!</b>\n\n"
-        f"📬 Yuborildi: <b>{success}</b>\n"
-        f"❌ Yuborilmadi: <b>{fail}</b>",
+        f"🎯 <b>Maqsad:</b> {target_description.title()}\n"
+        f"📬 <b>Yuborildi:</b> {success}\n"
+        f"❌ <b>Yuborilmadi:</b> {fail}",
         parse_mode=ParseMode.HTML
     )
 

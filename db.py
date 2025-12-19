@@ -109,6 +109,7 @@ async def init_db():
                 is_premium BOOLEAN DEFAULT FALSE,
                 balance NUMERIC(10, 2) DEFAULT 0.00,
                 total_deposited NUMERIC(10, 2) DEFAULT 0.00,
+                is_hidden BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
@@ -121,6 +122,7 @@ async def init_db():
             ('total_deposited', 'NUMERIC(10, 2) DEFAULT 0.00'),
             ('referral_code', 'TEXT UNIQUE'),
             ('referral_by', 'BIGINT REFERENCES users(user_id)'),
+            ('is_hidden', 'BOOLEAN DEFAULT FALSE'),
         ]
 
         for column_name, column_def in columns_to_add:
@@ -422,6 +424,148 @@ async def is_user_admin(pool, user_id: int) -> bool:
         return bool(row and row['is_admin'])
 
 
+async def is_user_premium(pool, user_id: int) -> bool:
+    """
+    Check if a user has premium status.
+    Returns True if user exists and is_premium is True, False otherwise.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT is_premium FROM users WHERE user_id = $1", user_id)
+        return bool(row and row['is_premium'])
+
+
+async def get_all_admin_ids(pool):
+    """Get all admin user IDs."""
+    async with pool.acquire() as conn:
+        admin_ids = await conn.fetch("SELECT user_id FROM users WHERE is_admin = TRUE")
+        return [row['user_id'] for row in admin_ids]
+
+
+async def update_user_info(pool, user_id: int, username: str, name: str):
+    """
+    Update user's username and name in the database if they've changed.
+    This should be called whenever we receive a message from a user to keep data up to date.
+    """
+    async with pool.acquire() as conn:
+        # Check current values
+        current = await conn.fetchrow("""
+            SELECT username, name FROM users WHERE user_id = $1
+        """, user_id)
+        
+        if not current:
+            # User doesn't exist, nothing to update
+            return
+        
+        # Update if values have changed
+        if current['username'] != username or current['name'] != name:
+            await conn.execute("""
+                UPDATE users 
+                SET username = $1, name = $2 
+                WHERE user_id = $3
+            """, username, name, user_id)
+
+
+async def set_user_hidden(pool, user_id: int) -> bool:
+    """
+    Set is_hidden to True for a user. Only works if user is premium.
+    Returns True if successful, False if user is not premium.
+    """
+    async with pool.acquire() as conn:
+        # Check if user is premium
+        is_premium = await conn.fetchval("""
+            SELECT is_premium FROM users WHERE user_id = $1
+        """, user_id)
+        
+        if not is_premium:
+            return False
+        
+        # Update is_hidden to True
+        await conn.execute("""
+            UPDATE users 
+            SET is_hidden = TRUE
+            WHERE user_id = $1
+        """, user_id)
+        
+        return True
+
+
+async def notify_admins_new_user(pool, bot, new_user_id: int, username: str, name: str):
+    """
+    Notify all admins when a new user joins the bot.
+    """
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    
+    try:
+        admin_ids = await get_all_admin_ids(pool)
+        if not admin_ids:
+            return
+        
+        # Get user info
+        user_link = f"tg://user?id={new_user_id}"
+        username_text = f"@{username}" if username else "Yo'q"
+        
+        notification_text = (
+            f"🆕 <b>Yangi foydalanuvchi qo'shildi!</b>\n\n"
+            f"👤 <b>Ism:</b> {name}\n"
+            f"🆔 <b>ID:</b> <code>{new_user_id}</code>\n"
+            f"📱 <b>Username:</b> {username_text}\n"
+            f"📅 <b>Vaqt:</b> {datetime.now(ZoneInfo(TIMEZONE)).strftime('%Y-%m-%d %H:%M')}"
+        )
+        
+        # Try to create keyboard with profile link, but handle privacy restrictions
+        from aiogram.exceptions import TelegramBadRequest
+        
+        try:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="👤 Profilni ko'rish", url=user_link)],
+                [InlineKeyboardButton(text="📊 Ma'lumotlarni ko'rish", callback_data=f"admin:select_user:{new_user_id}")]
+            ])
+            has_profile_button = True
+        except:
+            # If button creation fails, create keyboard without profile button
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📊 Ma'lumotlarni ko'rish", callback_data=f"admin:select_user:{new_user_id}")]
+            ])
+            has_profile_button = False
+        
+        # Send notification to all admins
+        for admin_id in admin_ids:
+            try:
+                await bot.send_message(
+                    chat_id=admin_id,
+                    text=notification_text,
+                    parse_mode='HTML',
+                    reply_markup=keyboard
+                )
+            except TelegramBadRequest as e:
+                # If privacy restricted, try without profile button
+                error_str = str(e).upper()
+                if "BUTTON_USER_PRIVACY_RESTRICTED" in error_str or "PRIVACY_RESTRICTED" in error_str:
+                    if has_profile_button:
+                        # Retry without profile button
+                        keyboard_no_profile = InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="📊 Ma'lumotlarni ko'rish", callback_data=f"admin:select_user:{new_user_id}")]
+                        ])
+                        try:
+                            await bot.send_message(
+                                chat_id=admin_id,
+                                text=notification_text,
+                                parse_mode='HTML',
+                                reply_markup=keyboard_no_profile
+                            )
+                        except Exception as e2:
+                            print(f"Error notifying admin {admin_id}: {e2}")
+                    else:
+                        print(f"Error notifying admin {admin_id}: {e}")
+                else:
+                    print(f"Error notifying admin {admin_id}: {e}")
+            except Exception as e:
+                # Log error but continue with other admins
+                print(f"Error notifying admin {admin_id}: {e}")
+    except Exception as e:
+        print(f"Error in notify_admins_new_user: {e}")
+
+
 async def get_user_balance_info(pool, user_id: int):
     """
     Get user's balance and total deposited amount.
@@ -607,8 +751,10 @@ async def activate_subscription(pool, user_id: int, plan: str):
             if active_sub:
                 # Extend existing subscription
                 existing_end_date = active_sub['end_date']
-                if existing_end_date.tzinfo is None:
-                    existing_end_date = existing_end_date.replace(tzinfo=ZoneInfo(TIMEZONE))
+                
+                # Ensure both datetimes are timezone-naive for comparison
+                if existing_end_date.tzinfo is not None:
+                    existing_end_date = existing_end_date.replace(tzinfo=None)
 
                 # If subscription hasn't expired, extend from end_date, otherwise from now
                 if existing_end_date > current_time:
@@ -780,18 +926,128 @@ async def process_referral(pool, new_user_id: int, referral_code: str, bot=None)
         return True
 
 
+async def get_user_referral_stats(pool, user_id: int):
+    """
+    Get referral statistics for a user.
+    Returns: (referral_count: int, referral_earnings: float, referral_code: str | None, referred_by: int | None, referrer_name: str | None)
+    """
+    async with pool.acquire() as conn:
+        # Get referral code
+        referral_code = await conn.fetchval("""
+            SELECT referral_code FROM users WHERE user_id = $1
+        """, user_id)
+        
+        # Count how many users this user referred
+        referral_count = await conn.fetchval("""
+            SELECT COUNT(*) FROM users WHERE referral_by = $1
+        """, user_id)
+        
+        # Calculate earnings from referrals (10 soums per referral)
+        referral_earnings = referral_count * 10.00
+        
+        # Get who referred this user
+        referred_by_info = await conn.fetchrow("""
+            SELECT referral_by FROM users WHERE user_id = $1
+        """, user_id)
+        
+        referred_by = referred_by_info['referral_by'] if referred_by_info and referred_by_info['referral_by'] else None
+        
+        # Get referrer name if exists
+        referrer_name = None
+        if referred_by:
+            referrer_info = await conn.fetchrow("""
+                SELECT name FROM users WHERE user_id = $1
+            """, referred_by)
+            referrer_name = referrer_info['name'] if referrer_info else None
+        
+        return referral_count, referral_earnings, referral_code, referred_by, referrer_name
+
+
+async def get_user_payment_history(pool, user_id: int, limit: int = 20):
+    """
+    Get payment history for a user.
+    Returns list of payment records.
+    """
+    async with pool.acquire() as conn:
+        payments = await conn.fetch("""
+            SELECT id, amount, method, status, transaction_id, merchant_data, created_at
+            FROM payments
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+        """, user_id, limit)
+        return [dict(payment) for payment in payments]
+
+
+async def get_user_full_info(pool, user_id: int):
+    """
+    Get comprehensive user information for admin panel.
+    Returns dict with all user details.
+    """
+    async with pool.acquire() as conn:
+        user = await conn.fetchrow("""
+            SELECT 
+                user_id, username, name, is_admin, is_superuser, is_premium,
+                balance, total_deposited, referral_code, referral_by, created_at
+            FROM users 
+            WHERE user_id = $1
+        """, user_id)
+        
+        if not user:
+            return None
+        
+        user_dict = dict(user)
+        
+        # Get subscription info
+        subscription = await conn.fetchrow("""
+            SELECT plan, start_date, end_date, is_active
+            FROM subscriptions
+            WHERE user_id = $1 AND is_active = TRUE
+            ORDER BY end_date DESC
+            LIMIT 1
+        """, user_id)
+        
+        user_dict['subscription'] = dict(subscription) if subscription else None
+        
+        # Get activity info (last message sent, last login, etc.)
+        last_message = await conn.fetchrow("""
+            SELECT sent_at FROM message_log
+            WHERE sender_id = $1
+            ORDER BY sent_at DESC
+            LIMIT 1
+        """, user_id)
+        
+        user_dict['last_activity'] = last_message['sent_at'] if last_message else None
+        
+        # Get referral stats
+        referral_count, referral_earnings, referral_code, referred_by, referrer_name = await get_user_referral_stats(pool, user_id)
+        user_dict['referral_count'] = referral_count
+        user_dict['referral_earnings'] = referral_earnings
+        user_dict['referrer_name'] = referrer_name
+        
+        return user_dict
+
+
 async def get_or_create_user(pool, user_id: int, username: str, name: str, referral_code: str = None):
     """
     Get user token if exists, otherwise create new user and return token.
     If referral_code is provided and user is new, process the referral.
-    Returns the user's token.
+    Also updates username and name if they've changed.
+    Returns (token: str, is_new_user: bool).
     """
     from utils import generate_token
 
     async with pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT token, referral_by FROM users WHERE user_id = $1", user_id)
+        row = await conn.fetchrow("SELECT token, referral_by, username, name FROM users WHERE user_id = $1", user_id)
         if row:
-            return row["token"]
+            # User exists - update username and name if changed
+            if row['username'] != username or row['name'] != name:
+                await conn.execute("""
+                    UPDATE users 
+                    SET username = $1, name = $2 
+                    WHERE user_id = $3
+                """, username, name, user_id)
+            return row["token"], False
         else:
             # New user - create them
             # Note: Don't set referral_by here - let process_referral handle it
@@ -804,7 +1060,7 @@ async def get_or_create_user(pool, user_id: int, username: str, name: str, refer
                 user_id, username, name, token, tashkent_time
             )
             
-            return token
+            return token, True
 
 
 # Chat-related database functions

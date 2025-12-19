@@ -37,3 +37,8 @@ class PremiumPurchaseState(StatesGroup):
     """States for premium purchase flow."""
     waiting_for_plan_selection = State()
 
+
+class AdminMessageState(StatesGroup):
+    """States for admin sending anonymous messages."""
+    waiting_for_message = State()
+

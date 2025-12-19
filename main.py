@@ -13,6 +13,7 @@ from db import init_db
 from handlers.user_handlers import user_router
 from handlers.admin_handlers import admin_router
 from handlers.chat_handlers import chat_router
+from middleware import UserUpdateMiddleware
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +28,10 @@ async def main():
     # Initialize database connection pool
     pool = await init_db()
     dp["db"] = pool
+
+    # Add middleware to update user info automatically
+    dp.message.middleware(UserUpdateMiddleware())
+    dp.callback_query.middleware(UserUpdateMiddleware())
 
     # Include routers
     dp.include_router(user_router)
