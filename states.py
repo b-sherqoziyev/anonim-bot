@@ -10,12 +10,12 @@ class QuestionStates(StatesGroup):
     waiting_for_question = State()
 
 
-class MuteState(StatesGroup):
-    """States for muting/unmuting users."""
+class BanState(StatesGroup):
+    """States for banning/unbanning users."""
     waiting_for_user_id = State()
     waiting_for_duration = State()
     waiting_for_reason = State()
-    waiting_for_unmute_id = State()
+    waiting_for_unban_id = State()
 
 
 class BroadcastState(StatesGroup):
@@ -31,4 +31,9 @@ class SearchUserState(StatesGroup):
 class ChatState(StatesGroup):
     """States for live chat feature."""
     in_chat = State()
+
+
+class PremiumPurchaseState(StatesGroup):
+    """States for premium purchase flow."""
+    waiting_for_plan_selection = State()
 

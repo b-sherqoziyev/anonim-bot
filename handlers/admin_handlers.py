@@ -1,6 +1,6 @@
 """
 Admin handlers module.
-Handles admin panel, mute/unmute, broadcast, statistics, live chat monitoring, and settings.
+Handles admin panel, ban/unban, broadcast, statistics, live chat monitoring, and settings.
 """
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -18,13 +18,13 @@ from db import (
     is_user_admin,
     get_all_active_chats,
     get_chat_message_count,
-    get_all_muted_users,
-    get_muted_users_count,
+    get_all_banned_users,
+    get_banned_users_count,
     admin_end_chat_by_id,
     log_admin_action,
     end_chat
 )
-from states import MuteState, BroadcastState, SearchUserState
+from states import BanState, BroadcastState, SearchUserState
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -104,7 +104,7 @@ async def show_statistics(callback: CallbackQuery, bot: Bot, dispatcher):
             "SELECT COUNT(*) FROM users WHERE created_at >= $1", month_start
         )
         active_chats_count = await conn.fetchval("SELECT COUNT(*) FROM chat_connections")
-        muted_count = await get_muted_users_count(pool)
+        banned_count = await get_banned_users_count(pool)
         queue_count = await conn.fetchval("SELECT COUNT(*) FROM chat_queue")
 
     text = (
@@ -113,7 +113,7 @@ async def show_statistics(callback: CallbackQuery, bot: Bot, dispatcher):
         f"📅 Oylik qo'shilganlar: <b>{month_users}</b>\n"
         f"📆 Kunlik qo'shilganlar: <b>{today_users}</b>\n"
         f"💬 Faol chatlar: <b>{active_chats_count}</b>\n"
-        f"⛔ Mute qilinganlar: <b>{muted_count}</b>\n"
+        f"⛔ Bloklanganlar: <b>{banned_count}</b>\n"
         f"⏳ Navbatda: <b>{queue_count}</b>"
     )
 
@@ -134,9 +134,9 @@ async def open_users_menu(callback: CallbackQuery):
     users_menu = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔍 Foydalanuvchini qidirish", callback_data="admin:search")],
         [InlineKeyboardButton(text="🆕 So'nggi 10 user", callback_data="admin:recent_users:1")],
-        [InlineKeyboardButton(text="⛔ Mute qilinganlar", callback_data="admin:muted_list")],
-        [InlineKeyboardButton(text="⛔ Bloklash / Mute", callback_data="admin:punish")],
-        [InlineKeyboardButton(text="🔓 Mute'dan chiqarish", callback_data="admin:unmute")],
+        [InlineKeyboardButton(text="⛔ Bloklanganlar", callback_data="admin:banned_list")],
+        [InlineKeyboardButton(text="⛔ Bloklash", callback_data="admin:punish")],
+        [InlineKeyboardButton(text="🔓 Blokdan chiqarish", callback_data="admin:unban")],
         [InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:back_to_panel")],
     ])
 
@@ -147,16 +147,16 @@ async def open_users_menu(callback: CallbackQuery):
     await callback.answer()
 
 
-@admin_router.callback_query(F.data == "admin:muted_list")
-async def show_muted_users(callback: CallbackQuery, bot: Bot, dispatcher):
-    """Show list of muted users."""
+@admin_router.callback_query(F.data == "admin:banned_list")
+async def show_banned_users(callback: CallbackQuery, bot: Bot, dispatcher):
+    """Show list of banned users."""
     pool = dispatcher["db"]
-    muted_users = await get_all_muted_users(pool)
+    banned_users = await get_all_banned_users(pool)
 
-    if not muted_users:
+    if not banned_users:
         await callback.message.edit_text(
-            "<b>⛔ Mute qilingan foydalanuvchilar</b>\n\n"
-            "😕 Hozircha mute qilingan foydalanuvchilar yo'q.",
+            "<b>⛔ Bloklangan foydalanuvchilar</b>\n\n"
+            "😕 Hozircha bloklangan foydalanuvchilar yo'q.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text="🔙 Orqaga", callback_data="admin:users")]
             ])
@@ -164,24 +164,20 @@ async def show_muted_users(callback: CallbackQuery, bot: Bot, dispatcher):
         await callback.answer()
         return
 
-    text = "<b>⛔ Mute qilingan foydalanuvchilar:</b>\n\n"
+    text = "<b>⛔ Bloklangan foydalanuvchilar:</b>\n\n"
     buttons = []
 
-    for muted in muted_users:
-        muted_until_str = muted["muted_until"].strftime("%Y-%m-%d %H:%M")
-        user_name = muted['name'] or "Noma'lum"
-        reason = muted['reason'] or "Ko'rsatilmagan"
+    for banned in banned_users:
+        user_name = banned['name'] or "Noma'lum"
         text += (
-            f"👤 <a href='tg://user?id={muted['user_id']}'>{user_name}</a>\n"
-            f"🆔 ID: <code>{muted['user_id']}</code>\n"
-            f"⏰ Mute: {muted_until_str}\n"
-            f"📝 Sabab: {reason}\n\n"
+            f"👤 <a href='tg://user?id={banned['user_id']}'>{user_name}</a>\n"
+            f"🆔 ID: <code>{banned['user_id']}</code>\n\n"
         )
-        button_text = muted['name'] or f"User {muted['user_id']}"
+        button_text = banned['name'] or f"User {banned['user_id']}"
         buttons.append([
             InlineKeyboardButton(
                 text=f"🔓 {button_text}",
-                callback_data=f"admin:unmute_user:{muted['user_id']}"
+                callback_data=f"admin:unban_user:{banned['user_id']}"
             )
         ])
 
@@ -195,9 +191,9 @@ async def show_muted_users(callback: CallbackQuery, bot: Bot, dispatcher):
     await callback.answer()
 
 
-@admin_router.callback_query(F.data.startswith("admin:unmute_user:"))
-async def unmute_user_from_list(callback: CallbackQuery, bot: Bot, dispatcher):
-    """Unmute user from the muted users list."""
+@admin_router.callback_query(F.data.startswith("admin:unban_user:"))
+async def unban_user_from_list(callback: CallbackQuery, bot: Bot, dispatcher):
+    """Unban user from the banned users list."""
     pool = dispatcher["db"]
     user_id = int(callback.data.split(":")[-1])
     admin_id = callback.from_user.id
@@ -206,20 +202,36 @@ async def unmute_user_from_list(callback: CallbackQuery, bot: Bot, dispatcher):
         result = await conn.execute("DELETE FROM muted_users WHERE user_id = $1", user_id)
 
     if result == "DELETE 1":
-        await log_admin_action(pool, admin_id, "unmute_user", f"User ID: {user_id}")
-        await callback.answer(f"✅ Foydalanuvchi mute'dan chiqarildi!", show_alert=True)
-        # Refresh the muted list
-        await show_muted_users(callback, bot, dispatcher)
+        await log_admin_action(pool, admin_id, "unban_user", f"User ID: {user_id}")
+        await callback.answer(f"✅ Foydalanuvchi blokdan chiqarildi!", show_alert=True)
+        # Refresh the banned list
+        await show_banned_users(callback, bot, dispatcher)
     else:
-        await callback.answer("❌ Bu foydalanuvchi bazada mute qilinmagan edi.", show_alert=True)
+        await callback.answer("❌ Bu foydalanuvchi bazada bloklanmagan edi.", show_alert=True)
 
 
 @admin_router.callback_query(F.data == "admin:search")
 async def ask_user_id(callback: CallbackQuery, state: FSMContext):
     """Start user search flow."""
-    await callback.message.edit_text("🔍 Qidirish uchun foydalanuvchi ID sini yuboring:")
+    await callback.message.edit_text(
+        "🔍 Qidirish uchun foydalanuvchi ID sini yuboring:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin:cancel_search")]
+        ])
+    )
     await state.set_state(SearchUserState.waiting_for_user_id)
     await callback.answer()
+
+
+@admin_router.callback_query(F.data == "admin:cancel_search")
+async def cancel_search(callback: CallbackQuery, state: FSMContext):
+    """Cancel search and return to admin panel."""
+    await state.clear()
+    await callback.message.edit_text(
+        "<b>👨‍💻 Admin panelga xush kelibsiz!</b>\nQuyidagilardan birini tanlang:",
+        reply_markup=get_main_menu_keyboard()
+    )
+    await callback.answer("❌ Qidiruv bekor qilindi.")
 
 
 @admin_router.message(SearchUserState.waiting_for_user_id)
@@ -243,15 +255,14 @@ async def show_user_info(message: Message, state: FSMContext, bot: Bot, dispatch
             await message.answer("😕 Bunday foydalanuvchi topilmadi.")
             return
 
-        muted_row = await conn.fetchrow("SELECT muted_until, reason FROM muted_users WHERE user_id = $1", user_id)
+        banned_row = await conn.fetchrow("SELECT user_id FROM muted_users WHERE user_id = $1", user_id)
         # Check if in active chat
         chat_row = await conn.fetchrow("""
             SELECT user1_id, user2_id FROM chat_connections 
             WHERE user1_id = $1 OR user2_id = $1
         """, user_id)
 
-    is_muted = bool(muted_row)
-    muted_until = muted_row["muted_until"] if muted_row else None
+    is_banned = bool(banned_row)
     in_chat = bool(chat_row)
     partner_id = None
     if chat_row:
@@ -263,20 +274,20 @@ async def show_user_info(message: Message, state: FSMContext, bot: Bot, dispatch
         f"📛 Ism: {user['name']}\n"
         f"🗓 Ro'yxatdan o'tgan: {user['created_at']:%Y-%m-%d %H:%M}\n"
         f"🛡 Admin: {'✅' if user['is_admin'] else '❌'}\n"
-        f"🔇 Mute: {'✅ ' + muted_until.strftime('%Y-%m-%d %H:%M') if is_muted else '❌'}\n"
+        f"🔇 Blok: {'✅' if is_banned else '❌'}\n"
         f"💬 Chatda: {'✅' if in_chat else '❌'}"
     )
 
     buttons = []
-    if is_muted:
+    if is_banned:
         buttons.append([InlineKeyboardButton(
-            text="🔓 Mute'dan chiqarish",
-            callback_data=f"admin:unmute_user:{user_id}"
+            text="🔓 Blokdan chiqarish",
+            callback_data=f"admin:unban_user:{user_id}"
         )])
     else:
         buttons.append([InlineKeyboardButton(
-            text="⛔ Mute qilish",
-            callback_data=f"admin:mute_user:{user_id}"
+            text="⛔ Bloklash",
+            callback_data=f"admin:ban_user:{user_id}"
         )])
 
     if in_chat and partner_id:
@@ -294,15 +305,29 @@ async def show_user_info(message: Message, state: FSMContext, bot: Bot, dispatch
     )
 
 
-@admin_router.callback_query(F.data.startswith("admin:mute_user:"))
-async def mute_user_from_info(callback: CallbackQuery, state: FSMContext):
-    """Start mute flow for a specific user."""
+@admin_router.callback_query(F.data.startswith("admin:ban_user:"))
+async def ban_user_from_info(callback: CallbackQuery, bot: Bot, dispatcher):
+    """Ban a specific user immediately."""
+    pool = dispatcher["db"]
     user_id = int(callback.data.split(":")[-1])
-    await state.update_data(target_user_id=user_id)
-    await state.set_state(MuteState.waiting_for_duration)
-    await callback.message.edit_text(
-        f"⏰ <code>{user_id}</code> foydalanuvchisini necha daqiqaga mute qilish? (Masalan: 60)")
-    await callback.answer()
+    admin_id = callback.from_user.id
+    
+    # Set muted_until to a far future date (e.g., 100 years from now)
+    muted_until = (datetime.now(ZoneInfo(TIMEZONE)) + timedelta(days=36500)).replace(tzinfo=None)
+    
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO muted_users (user_id, muted_until, reason)
+            VALUES ($1, $2, NULL)
+            ON CONFLICT (user_id) DO UPDATE
+            SET muted_until = $2, reason = NULL, created_at = CURRENT_TIMESTAMP
+        """, user_id, muted_until)
+
+    await log_admin_action(pool, admin_id, "ban_user", f"User ID: {user_id}")
+    await callback.answer(f"✅ Foydalanuvchi bloklandi!", show_alert=True)
+    
+    # Refresh the user info display
+    await select_user(callback, bot, dispatcher)
 
 
 @admin_router.callback_query(F.data.startswith("admin:end_user_chat:"))
@@ -390,14 +415,13 @@ async def select_user(callback: CallbackQuery, bot: Bot, dispatcher):
             await callback.answer()
             return
 
-        muted_row = await conn.fetchrow("SELECT muted_until, reason FROM muted_users WHERE user_id = $1", user_id)
+        banned_row = await conn.fetchrow("SELECT user_id FROM muted_users WHERE user_id = $1", user_id)
         chat_row = await conn.fetchrow("""
             SELECT user1_id, user2_id FROM chat_connections 
             WHERE user1_id = $1 OR user2_id = $1
         """, user_id)
 
-    is_muted = bool(muted_row)
-    muted_until = muted_row["muted_until"] if muted_row else None
+    is_banned = bool(banned_row)
     in_chat = bool(chat_row)
     partner_id = None
     if chat_row:
@@ -409,20 +433,20 @@ async def select_user(callback: CallbackQuery, bot: Bot, dispatcher):
         f"📛 Ism: {user['name']}\n"
         f"🗓 Ro'yxatdan o'tgan: {user['created_at']:%Y-%m-%d %H:%M}\n"
         f"🛡 Admin: {'✅' if user['is_admin'] else '❌'}\n"
-        f"🔇 Mute: {'✅ ' + muted_until.strftime('%Y-%m-%d %H:%M') if is_muted else '❌'}\n"
+        f"🔇 Blok: {'✅' if is_banned else '❌'}\n"
         f"💬 Chatda: {'✅' if in_chat else '❌'}"
     )
 
     buttons = []
-    if is_muted:
+    if is_banned:
         buttons.append([InlineKeyboardButton(
-            text="🔓 Mute'dan chiqarish",
-            callback_data=f"admin:unmute_user:{user_id}"
+            text="🔓 Blokdan chiqarish",
+            callback_data=f"admin:unban_user:{user_id}"
         )])
     else:
         buttons.append([InlineKeyboardButton(
-            text="⛔ Mute qilish",
-            callback_data=f"admin:mute_user:{user_id}"
+            text="⛔ Bloklash",
+            callback_data=f"admin:ban_user:{user_id}"
         )])
 
     if in_chat and partner_id:
@@ -441,81 +465,89 @@ async def select_user(callback: CallbackQuery, bot: Bot, dispatcher):
     await callback.answer()
 
 
-# ==================== MUTE/UNMUTE ====================
+# ==================== BAN/UNBAN ====================
 
 @admin_router.callback_query(F.data == "admin:punish")
-async def start_mute(callback: CallbackQuery, state: FSMContext):
-    """Start mute user flow."""
-    await state.set_state(MuteState.waiting_for_user_id)
-    await callback.message.edit_text("🆔 Foydalanuvchi ID raqamini yuboring:")
+async def start_ban(callback: CallbackQuery, state: FSMContext):
+    """Start ban user flow."""
+    await state.set_state(BanState.waiting_for_user_id)
+    await callback.message.edit_text(
+        "🆔 Foydalanuvchi ID raqamini yuboring:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin:cancel_ban")]
+        ])
+    )
     await callback.answer()
 
 
-@admin_router.message(MuteState.waiting_for_user_id)
-async def get_user_id(message: Message, state: FSMContext):
-    """Get user ID for muting."""
+@admin_router.callback_query(F.data == "admin:cancel_ban")
+async def cancel_ban(callback: CallbackQuery, state: FSMContext):
+    """Cancel ban and return to admin panel."""
+    await state.clear()
+    await callback.message.edit_text(
+        "<b>👨‍💻 Admin panelga xush kelibsiz!</b>\nQuyidagilardan birini tanlang:",
+        reply_markup=get_main_menu_keyboard()
+    )
+    await callback.answer("❌ Bloklash bekor qilindi.")
+
+
+@admin_router.message(BanState.waiting_for_user_id)
+async def get_user_id(message: Message, state: FSMContext, bot: Bot, dispatcher):
+    """Get user ID for banning and ban immediately."""
     try:
         user_id = int(message.text.strip())
-        await state.update_data(user_id=user_id)
-        await state.set_state(MuteState.waiting_for_duration)
-        await message.answer("⏰ Mute necha daqiqaga bo'lsin? (Masalan: 60)")
+        await state.clear()
+        admin_id = message.from_user.id
+
+        pool = dispatcher["db"]
+        # Set muted_until to a far future date (e.g., 100 years from now)
+        muted_until = (datetime.now(ZoneInfo(TIMEZONE)) + timedelta(days=36500)).replace(tzinfo=None)
+        
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO muted_users (user_id, muted_until, reason)
+                VALUES ($1, $2, NULL)
+                ON CONFLICT (user_id) DO UPDATE
+                SET muted_until = $2, reason = NULL, created_at = CURRENT_TIMESTAMP
+            """, user_id, muted_until)
+
+        await log_admin_action(pool, admin_id, "ban_user", f"User ID: {user_id}")
+
+        await message.answer(
+            f"✅ <a href='tg://user?id={user_id}'>Foydalanuvchi</a> bloklandi.",
+            parse_mode="HTML"
+        )
     except ValueError:
         await message.answer("❌ Noto'g'ri ID. Qayta urinib ko'ring.")
 
 
-@admin_router.message(MuteState.waiting_for_duration)
-async def get_duration(message: Message, state: FSMContext):
-    """Get mute duration in minutes."""
-    try:
-        minutes = int(message.text.strip())
-        muted_until = (datetime.now(ZoneInfo(TIMEZONE)) + timedelta(minutes=minutes)).replace(tzinfo=None)
-        await state.update_data(muted_until=muted_until)
-        await state.set_state(MuteState.waiting_for_reason)
-        await message.answer("📝 Sababni yozing:")
-    except ValueError:
-        await message.answer("❌ Noto'g'ri raqam. Qayta urinib ko'ring.")
-
-
-@admin_router.message(MuteState.waiting_for_reason)
-async def finish_mute(message: Message, state: FSMContext, bot: Bot, dispatcher):
-    """Complete mute process and save to database."""
-    data = await state.get_data()
-    await state.clear()
-
-    user_id = data.get('user_id') or data.get('target_user_id')
-    muted_until = data['muted_until']
-    reason = message.text.strip()
-    admin_id = message.from_user.id
-
-    pool = dispatcher["db"]
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO muted_users (user_id, muted_until, reason)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (user_id) DO UPDATE
-            SET muted_until = $2, reason = $3, created_at = CURRENT_TIMESTAMP
-        """, user_id, muted_until, reason)
-
-    await log_admin_action(pool, admin_id, "mute_user", f"User ID: {user_id}, Until: {muted_until}, Reason: {reason}")
-
-    await message.answer(
-        f"✅ <a href='tg://user?id={user_id}'>Foydalanuvchi</a> {muted_until:%Y-%m-%d %H:%M} gacha mute qilindi.\n"
-        f"Sabab: <i>{reason}</i>",
-        parse_mode="HTML"
+@admin_router.callback_query(F.data == "admin:unban")
+async def ask_user_id_for_unban(callback: CallbackQuery, state: FSMContext):
+    """Start unban user flow."""
+    await state.set_state(BanState.waiting_for_unban_id)
+    await callback.message.edit_text(
+        "🔓 Blokdan chiqariladigan foydalanuvchi ID sini kiriting:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin:cancel_unban")]
+        ])
     )
-
-
-@admin_router.callback_query(F.data == "admin:unmute")
-async def ask_user_id_for_unmute(callback: CallbackQuery, state: FSMContext):
-    """Start unmute user flow."""
-    await state.set_state(MuteState.waiting_for_unmute_id)
-    await callback.message.answer("🔓 Mute'dan chiqariladigan foydalanuvchi ID sini kiriting:")
     await callback.answer()
 
 
-@admin_router.message(MuteState.waiting_for_unmute_id)
-async def unmute_user(message: Message, state: FSMContext, bot: Bot, dispatcher):
-    """Remove user from mute list."""
+@admin_router.callback_query(F.data == "admin:cancel_unban")
+async def cancel_unban(callback: CallbackQuery, state: FSMContext):
+    """Cancel unban and return to admin panel."""
+    await state.clear()
+    await callback.message.edit_text(
+        "<b>👨‍💻 Admin panelga xush kelibsiz!</b>\nQuyidagilardan birini tanlang:",
+        reply_markup=get_main_menu_keyboard()
+    )
+    await callback.answer("❌ Blokdan chiqarish bekor qilindi.")
+
+
+@admin_router.message(BanState.waiting_for_unban_id)
+async def unban_user(message: Message, state: FSMContext, bot: Bot, dispatcher):
+    """Remove user from ban list."""
     user_id = message.text.strip()
     await state.clear()
     admin_id = message.from_user.id
@@ -525,13 +557,13 @@ async def unmute_user(message: Message, state: FSMContext, bot: Bot, dispatcher)
         result = await conn.execute("DELETE FROM muted_users WHERE user_id = $1", int(user_id))
 
     if result == "DELETE 1":
-        await log_admin_action(pool, admin_id, "unmute_user", f"User ID: {user_id}")
+        await log_admin_action(pool, admin_id, "unban_user", f"User ID: {user_id}")
         await message.answer(
-            f"✅ <a href='tg://user?id={user_id}'>Foydalanuvchi</a> mute'dan chiqarildi.",
+            f"✅ <a href='tg://user?id={user_id}'>Foydalanuvchi</a> blokdan chiqarildi.",
             parse_mode="HTML"
         )
     else:
-        await message.answer("❌ Bu foydalanuvchi bazada mute qilinmagan edi.")
+        await message.answer("❌ Bu foydalanuvchi bazada bloklanmagan edi.")
 
 
 # ==================== BROADCAST ====================
@@ -542,9 +574,23 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BroadcastState.waiting_for_message)
     await callback.message.edit_text(
         "<b>📢 Yubormoqchi bo'lgan xabaringizni yozing:</b>\n"
-        "Matn yoki rasm/video bilan matn ham bo'lishi mumkin."
+        "Matn yoki rasm/video bilan matn ham bo'lishi mumkin.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="admin:cancel_broadcast")]
+        ])
     )
     await callback.answer()
+
+
+@admin_router.callback_query(F.data == "admin:cancel_broadcast")
+async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
+    """Cancel broadcast and return to admin panel."""
+    await state.clear()
+    await callback.message.edit_text(
+        "<b>👨‍💻 Admin panelga xush kelibsiz!</b>\nQuyidagilardan birini tanlang:",
+        reply_markup=get_main_menu_keyboard()
+    )
+    await callback.answer("❌ Broadcast bekor qilindi.")
 
 
 @admin_router.message(BroadcastState.waiting_for_message)
@@ -757,7 +803,7 @@ async def show_settings(callback: CallbackQuery, bot: Bot, dispatcher):
     async with pool.acquire() as conn:
         total_users = await conn.fetchval("SELECT COUNT(*) FROM users")
         active_chats = await conn.fetchval("SELECT COUNT(*) FROM chat_connections")
-        muted_count = await get_muted_users_count(pool)
+        banned_count = await get_banned_users_count(pool)
         queue_count = await conn.fetchval("SELECT COUNT(*) FROM chat_queue")
 
     text = (
@@ -765,7 +811,7 @@ async def show_settings(callback: CallbackQuery, bot: Bot, dispatcher):
         "<b>📊 Joriy holat:</b>\n"
         f"👥 Foydalanuvchilar: <b>{total_users}</b>\n"
         f"💬 Faol chatlar: <b>{active_chats}</b>\n"
-        f"⛔ Mute qilinganlar: <b>{muted_count}</b>\n"
+        f"⛔ Bloklanganlar: <b>{banned_count}</b>\n"
         f"⏳ Navbatda: <b>{queue_count}</b>\n\n"
         "<b>🔧 Sozlamalar:</b>\n"
         "• Live chat: ✅ Faol\n"

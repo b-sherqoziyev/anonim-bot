@@ -16,7 +16,7 @@ from db import (
     get_chat_partner,
     end_chat,
     remove_from_chat_queue,
-    is_user_muted,
+    is_user_banned,
     get_or_create_user
 )
 from states import ChatState
@@ -33,14 +33,12 @@ async def find_chat_handler(message: Message, state: FSMContext, bot: Bot, dispa
     username = message.from_user.username
     name = message.from_user.full_name
 
-    # Check if user is muted
-    is_muted, muted_until = await is_user_muted(pool, user_id)
-    if is_muted:
-        vaqt_str = muted_until.strftime("%Y-%m-%d %H:%M:%S")
+    # Check if user is banned
+    is_banned, banned_until = await is_user_banned(pool, user_id)
+    if is_banned:
         await message.answer(
-            f"⛔ Siz vaqtinchalik xabar yubora olmaysiz.\n"
-            f"🕒 Mute Toshkent vaqti bilan {vaqt_str} gacha davom etadi.\n"
-            f"Iltimos, kuting."
+            "⛔ Siz bloklangan va chat qidira olmaysiz.\n"
+            "Iltimos, admin bilan bog'laning."
         )
         return
 
@@ -61,7 +59,7 @@ async def find_chat_handler(message: Message, state: FSMContext, bot: Bot, dispa
             await message.answer("⚠️ Siz allaqachon chatdasiz! Chatni tugatish uchun /end_chat buyrug'ini yuboring.")
             return
         elif status == "already_in_queue":
-            await message.answer("⏳ Siz allaqachon navbatdasiz. Suhbatdosh qidirilmoqda...")
+            await message.answer("⏳ Siz allaqachon navbatdasiz. Suhbatdosh qidirilmoqda...\n\nBekor qilish uchun 👉 /end_chat")
             return
 
     # Try to find a partner
@@ -75,7 +73,7 @@ async def find_chat_handler(message: Message, state: FSMContext, bot: Bot, dispa
         try:
             await bot.send_message(
                 chat_id=user_id,
-                text="✅ Suhbatdosh topildi!"
+                text="✅ Suhbatdosh topildi!\n\n Chatni yakunlash uchun: /end_chat"
             )
             await bot.send_message(
                 chat_id=partner_id,
@@ -89,7 +87,7 @@ async def find_chat_handler(message: Message, state: FSMContext, bot: Bot, dispa
             return
     else:
         # No partner found, user is in queue
-        await message.answer("⏳ Suhbatdosh qidirilmoqda... Iltimos, kuting.")
+        await message.answer("⏳ Suhbatdosh qidirilmoqda... Iltimos, kuting.\n\nBekor qilish uchun 👉 /end_chat")
 
 
 @chat_router.message(Command("end_chat"))
