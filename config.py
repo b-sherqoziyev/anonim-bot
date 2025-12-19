@@ -17,3 +17,4 @@ ADMIN_URL = os.getenv("ADMIN_URL")
 # Timezone configuration
 TIMEZONE = "Asia/Tashkent"
 
+
