@@ -33,3 +33,4 @@ class UserUpdateMiddleware(BaseMiddleware):
         
         # Continue to handler
         return await handler(event, data)
+
